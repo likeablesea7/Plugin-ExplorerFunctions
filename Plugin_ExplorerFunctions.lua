@@ -15,7 +15,6 @@ local DATA_KEY_BASE = "ExplorerFunctions_Data_v1" -- suffixed with GameId per ex
 -- Hex colors for RichText fragments (mirrors THEME.textDim / an accent green).
 local DIM_HEX = "#8C8C8C"
 local VALUE_HEX = "#8FE6A8"
-local WARN_HEX = "#E0A030"
 
 local THEME = {
 	bg       = Color3.fromRGB(30, 30, 30),
@@ -34,25 +33,6 @@ local THEME = {
 	addBtnHover = Color3.fromRGB(64, 150, 86),
 }
 
--- Per-ClassName color (hex, for RichText), reused from the previous plugin so
--- classes read the same across both tools (used to tint the Swap menu rows).
-local CLASS_COLOR = {
-	ScrollingFrame = "#8FE6A8", -- light green
-	TextBox        = "#8FE6A8", -- light green
-	TextButton     = "#45C46A", -- green
-	ImageButton    = "#45C46A", -- green
-	Frame          = "#F0913C", -- orange
-	CanvasGroup    = "#F0913C", -- orange
-	TextLabel      = "#6496F5", -- blue
-	ImageLabel     = "#6496F5", -- blue
-	ViewportFrame  = "#ec9eff", -- pinkish-purple
-	VideoFrame     = "#ec9eff", -- pinkish-purple
-}
-
-local function classColor(cn)
-	return CLASS_COLOR[cn]
-end
-
 --============================================================
 -- Property catalog
 --
@@ -63,6 +43,9 @@ end
 --============================================================
 
 local PROP_CATALOG = {
+	{ cat = "Background", style = true, props = {
+		"BackgroundColor3", "BackgroundTransparency", "BorderColor3", "BorderSizePixel", "BorderMode",
+	}},
 	{ cat = "Transform", props = {
 		"Position", "Size", "AnchorPoint", "Rotation", "AutomaticSize", "SizeConstraint",
 	}},
@@ -72,9 +55,6 @@ local PROP_CATALOG = {
 	{ cat = "Behavior", props = {
 		"Active", "Selectable", "AutoButtonColor", "Modal", "Selected",
 		"ScrollingEnabled", "ClearTextOnFocus", "TextEditable", "MultiLine",
-	}},
-	{ cat = "Background", style = true, props = {
-		"BackgroundColor3", "BackgroundTransparency", "BorderColor3", "BorderSizePixel", "BorderMode",
 	}},
 	{ cat = "Text", style = true, props = {
 		"FontFace", "TextColor3", "TextSize", "TextScaled", "TextWrapped",
@@ -123,12 +103,33 @@ for _, group in ipairs(PROP_CATALOG) do
 	end
 end
 
--- Classes an element may be swapped into (all GuiObject-derived). The current
--- class is excluded at menu-build time.
-local SWAP_CLASSES = {
-	"Frame", "ScrollingFrame", "CanvasGroup", "ViewportFrame", "VideoFrame",
-	"TextLabel", "TextButton", "TextBox",
-	"ImageLabel", "ImageButton",
+-- Position / size related properties (used by the "Copy Pos" button).
+local POS_SET = {
+	Position = true, Size = true, AnchorPoint = true, Rotation = true,
+	AutomaticSize = true, SizeConstraint = true, LayoutOrder = true,
+}
+
+-- Classes an element may be swapped into, ranked most-commonly-used first (this
+-- is the top-to-bottom order in the Swap menu). The current class is skipped.
+local SWAP_ORDER = {
+	"Frame", "ImageButton", "ScrollingFrame", "TextLabel", "TextBox",
+	"ImageLabel", "TextButton", "CanvasGroup", "ViewportFrame", "VideoFrame",
+}
+
+-- Icon image for each swap class, shown to the left of the class name. Set these
+-- to your own rbxassetid://... values; an empty string shows a blank placeholder
+-- box so you can fill the icons in later.
+local SWAP_ICONS = {
+	Frame          = "",
+	ImageButton    = "",
+	ScrollingFrame = "",
+	TextLabel      = "",
+	TextBox        = "",
+	ImageLabel     = "",
+	TextButton     = "",
+	CanvasGroup    = "",
+	ViewportFrame  = "",
+	VideoFrame     = "",
 }
 
 --============================================================
@@ -146,9 +147,6 @@ local copied = {}
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
 -- that a previous swap's class couldn't hold, if a later class supports it.
 local swapMemory = setmetatable({}, { __mode = "k" })
-
--- Cache of which catalog props a class supports (built from a throwaway sample).
-local classPropsCache = {}
 
 -- forward declarations
 local refreshAll, refreshTabs, refreshTopbar, refreshPage, save
@@ -318,25 +316,6 @@ local function recorded(name, fn)
 	if not ok then
 		warn("[ExplorerFunctions] " .. tostring(err))
 	end
-end
-
--- Does a class support a catalog property? (Built once per class from a sample.)
-local function classSupportsProp(className, propName)
-	local set = classPropsCache[className]
-	if not set then
-		set = {}
-		local ok, temp = pcall(function() return Instance.new(className) end)
-		if ok and temp then
-			for _, name in ipairs(PROP_ORDER) do
-				if (pcall(function() return temp[name] end)) then
-					set[name] = true
-				end
-			end
-			temp:Destroy()
-		end
-		classPropsCache[className] = set
-	end
-	return set[propName] == true
 end
 
 -- Union of this element's live properties with anything remembered for it from a
@@ -577,37 +556,43 @@ pageArea.Parent = content
 -- Copy overlay (property picker)
 --============================================================
 
+-- Overlay top/bottom bar heights (match the old plugin's info-bar height).
+local TOPBAR_H = 26
+local BOTTOMBAR_H = 26
+
 local copyOverlay = makeOverlay()
 
+-- Top bar: title (left) + Copy / Close (right). Title styled like the old
+-- plugin's "Press Ctrl+C to copy..." info line (Gotham, size 12).
 local copyBar = Instance.new("Frame")
 copyBar.BackgroundColor3 = THEME.bar
 copyBar.BorderSizePixel = 0
-copyBar.Size = UDim2.new(1, 0, 0, 30)
+copyBar.Size = UDim2.new(1, 0, 0, TOPBAR_H)
 copyBar.ZIndex = 51
 copyBar.Parent = copyOverlay
 
 local copyTitle = Instance.new("TextLabel")
 copyTitle.BackgroundTransparency = 1
-copyTitle.Position = UDim2.new(0, 10, 0, 0)
-copyTitle.Size = UDim2.new(1, -140, 1, 0)
-copyTitle.Font = Enum.Font.GothamMedium
-copyTitle.TextSize = 13
+copyTitle.Position = UDim2.new(0, 8, 0, 0)
+copyTitle.Size = UDim2.new(1, -130, 1, 0)
+copyTitle.Font = Enum.Font.Gotham
+copyTitle.TextSize = 12
 copyTitle.TextColor3 = THEME.text
 copyTitle.TextXAlignment = Enum.TextXAlignment.Left
 copyTitle.TextTruncate = Enum.TextTruncate.AtEnd
-copyTitle.Text = "Copy Properties"
+copyTitle.Text = "Copy"
 copyTitle.ZIndex = 52
 copyTitle.Parent = copyBar
 
+-- Copy confirm: styled the same as Close (no accent color).
 local copyConfirm = createBtnVisual(copyBar, "Copy")
 copyConfirm.AutomaticSize = Enum.AutomaticSize.None
 copyConfirm.AnchorPoint = Vector2.new(1, 0.5)
 copyConfirm.Position = UDim2.new(1, -68, 0.5, 0)
 copyConfirm.Size = UDim2.new(0, 56, 0, 22)
-copyConfirm.BackgroundColor3 = THEME.addBtn
 copyConfirm.ZIndex = 52
-copyConfirm.MouseEnter:Connect(function() copyConfirm.BackgroundColor3 = THEME.addBtnHover end)
-copyConfirm.MouseLeave:Connect(function() copyConfirm.BackgroundColor3 = THEME.addBtn end)
+copyConfirm.MouseEnter:Connect(function() copyConfirm.BackgroundColor3 = THEME.btnHover end)
+copyConfirm.MouseLeave:Connect(function() copyConfirm.BackgroundColor3 = THEME.btn end)
 
 local copyCloseBtn = createBtnVisual(copyBar, "Close")
 copyCloseBtn.AutomaticSize = Enum.AutomaticSize.None
@@ -618,16 +603,43 @@ copyCloseBtn.ZIndex = 52
 copyCloseBtn.MouseEnter:Connect(function() copyCloseBtn.BackgroundColor3 = THEME.btnHover end)
 copyCloseBtn.MouseLeave:Connect(function() copyCloseBtn.BackgroundColor3 = THEME.btn end)
 
--- Sub bar: All / None + selected count
-local copySub = Instance.new("Frame")
-copySub.BackgroundColor3 = THEME.bar
-copySub.BorderSizePixel = 0
-copySub.Position = UDim2.new(0, 0, 0, 30)
-copySub.Size = UDim2.new(1, 0, 0, 26)
-copySub.ZIndex = 51
-copySub.Parent = copyOverlay
+local copyScroll = Instance.new("ScrollingFrame")
+copyScroll.BackgroundColor3 = THEME.bg
+copyScroll.BorderColor3 = THEME.border
+copyScroll.BorderSizePixel = 1
+copyScroll.Position = UDim2.new(0, 0, 0, TOPBAR_H)
+copyScroll.Size = UDim2.new(1, 0, 1, -(TOPBAR_H + BOTTOMBAR_H))
+copyScroll.ClipsDescendants = true
+copyScroll.ScrollBarThickness = 8
+copyScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+copyScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+copyScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+copyScroll.ZIndex = 51
+copyScroll.Parent = copyOverlay
+do
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = copyScroll
+	local pad = Instance.new("UIPadding")
+	pad.PaddingTop = UDim.new(0, 6)
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.PaddingBottom = UDim.new(0, 12)
+	pad.Parent = copyScroll
+end
 
-local allBtn = createBtnVisual(copySub, "All")
+-- Bottom bar (styled like the old plugin's bottom "Key:" panel): All / None + count.
+local copyBottom = Instance.new("Frame")
+copyBottom.BackgroundColor3 = THEME.bar
+copyBottom.BorderSizePixel = 0
+copyBottom.AnchorPoint = Vector2.new(0, 1)
+copyBottom.Position = UDim2.new(0, 0, 1, 0)
+copyBottom.Size = UDim2.new(1, 0, 0, BOTTOMBAR_H)
+copyBottom.ZIndex = 51
+copyBottom.Parent = copyOverlay
+
+local allBtn = createBtnVisual(copyBottom, "All")
 allBtn.AutomaticSize = Enum.AutomaticSize.None
 allBtn.AnchorPoint = Vector2.new(0, 0.5)
 allBtn.Position = UDim2.new(0, 8, 0.5, 0)
@@ -636,7 +648,7 @@ allBtn.ZIndex = 52
 allBtn.MouseEnter:Connect(function() allBtn.BackgroundColor3 = THEME.btnHover end)
 allBtn.MouseLeave:Connect(function() allBtn.BackgroundColor3 = THEME.btn end)
 
-local noneBtn = createBtnVisual(copySub, "None")
+local noneBtn = createBtnVisual(copyBottom, "None")
 noneBtn.AutomaticSize = Enum.AutomaticSize.None
 noneBtn.AnchorPoint = Vector2.new(0, 0.5)
 noneBtn.Position = UDim2.new(0, 58, 0.5, 0)
@@ -649,52 +661,20 @@ local copyCount = Instance.new("TextLabel")
 copyCount.BackgroundTransparency = 1
 copyCount.AnchorPoint = Vector2.new(1, 0.5)
 copyCount.Position = UDim2.new(1, -10, 0.5, 0)
-copyCount.Size = UDim2.new(0, 160, 1, 0)
+copyCount.Size = UDim2.new(0, 120, 1, 0)
 copyCount.Font = Enum.Font.Gotham
 copyCount.TextSize = 12
 copyCount.TextColor3 = THEME.textDim
 copyCount.TextXAlignment = Enum.TextXAlignment.Right
 copyCount.Text = ""
 copyCount.ZIndex = 52
-copyCount.Parent = copySub
-
-local copyScroll = Instance.new("ScrollingFrame")
-copyScroll.BackgroundColor3 = THEME.bg
-copyScroll.BorderColor3 = THEME.border
-copyScroll.BorderSizePixel = 1
-copyScroll.Position = UDim2.new(0, 0, 0, 56)
-copyScroll.Size = UDim2.new(1, 0, 1, -56)
-copyScroll.ClipsDescendants = true
-copyScroll.ScrollBarThickness = 8
-copyScroll.ScrollingDirection = Enum.ScrollingDirection.Y
-copyScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-copyScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-copyScroll.ZIndex = 51
-copyScroll.Parent = copyOverlay
-do
-	local layout = Instance.new("UIListLayout")
-	layout.FillDirection = Enum.FillDirection.Vertical
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Padding = UDim.new(0, 2)
-	layout.Parent = copyScroll
-	local pad = Instance.new("UIPadding")
-	pad.PaddingTop = UDim.new(0, 6)
-	pad.PaddingLeft = UDim.new(0, 8)
-	pad.PaddingRight = UDim.new(0, 8)
-	pad.PaddingBottom = UDim.new(0, 10)
-	pad.Parent = copyScroll
-end
+copyCount.Parent = copyBottom
 
 local copyMenuItems = {} -- { name, value, checked, cb (checkbox), row }
 
+-- Checked box uses the selected-tab blue (no checkmark icon); unchecked uses btn.
 local function paintCheckbox(item)
-	if item.checked then
-		item.cb.BackgroundColor3 = THEME.addBtn
-		item.cb.Text = "✓"
-	else
-		item.cb.BackgroundColor3 = THEME.btn
-		item.cb.Text = ""
-	end
+	item.cb.BackgroundColor3 = item.checked and THEME.rowSel or THEME.btn
 end
 
 local function updateCopyCount()
@@ -702,7 +682,7 @@ local function updateCopyCount()
 	for _, item in ipairs(copyMenuItems) do
 		if item.checked then n += 1 end
 	end
-	copyCount.Text = n .. " / " .. #copyMenuItems .. " selected"
+	copyCount.Text = n .. " / " .. #copyMenuItems
 end
 
 local function setAllChecked(v)
@@ -716,12 +696,12 @@ end
 local function copyHeaderRow(text, order)
 	local h = Instance.new("TextLabel")
 	h.BackgroundTransparency = 1
-	h.Size = UDim2.new(1, 0, 0, 20)
+	h.Size = UDim2.new(1, 0, 0, 22)
 	h.Font = Enum.Font.GothamBold
-	h.TextSize = 13
+	h.TextSize = 14
 	h.TextColor3 = THEME.header
 	h.TextXAlignment = Enum.TextXAlignment.Left
-	h.Text = "-- " .. text
+	h.Text = "-- " .. text .. " " .. string.rep("-", 20)
 	h.LayoutOrder = order
 	h.ZIndex = 52
 	h.Parent = copyScroll
@@ -733,7 +713,7 @@ local function copyPropRow(p, order)
 	row.BackgroundColor3 = THEME.rowHover
 	row.BackgroundTransparency = 1
 	row.BorderSizePixel = 0
-	row.Size = UDim2.new(1, 0, 0, 20)
+	row.Size = UDim2.new(1, 0, 0, 18)
 	row.Font = Enum.Font.Code
 	row.TextSize = 14
 	row.TextXAlignment = Enum.TextXAlignment.Left
@@ -747,28 +727,24 @@ local function copyPropRow(p, order)
 	row.ZIndex = 52
 	do
 		local pad = Instance.new("UIPadding")
-		pad.PaddingLeft = UDim.new(0, 6)
-		pad.PaddingRight = UDim.new(0, 30)
+		pad.PaddingRight = UDim.new(0, 26)
 		pad.Parent = row
 	end
 	row.Parent = copyScroll
 
+	-- Checkbox: styled like a selected tab button (blue when on), no checkmark.
 	local cb = Instance.new("TextButton")
 	cb.AutoButtonColor = false
 	cb.AnchorPoint = Vector2.new(1, 0.5)
-	cb.Position = UDim2.new(1, -6, 0.5, 0)
-	cb.Size = UDim2.new(0, 18, 0, 18)
+	cb.Position = UDim2.new(1, -4, 0.5, 0)
+	cb.Size = UDim2.new(0, 16, 0, 16)
 	cb.BackgroundColor3 = THEME.btn
-	cb.BorderColor3 = THEME.border
-	cb.BorderSizePixel = 1
-	cb.Font = Enum.Font.GothamBold
-	cb.TextSize = 13
-	cb.TextColor3 = Color3.new(1, 1, 1)
+	cb.BorderSizePixel = 0
 	cb.Text = ""
 	cb.ZIndex = 53
 	do
 		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 3)
+		corner.CornerRadius = UDim.new(0, 4)
 		corner.Parent = cb
 	end
 	cb.Parent = row
@@ -791,20 +767,24 @@ local function copyPropRow(p, order)
 	return item
 end
 
+-- Build (or rebuild) the Copy menu for the current Explorer selection. Opens
+-- regardless of selection; with nothing valid selected it shows a prompt and no
+-- rows, and re-runs live whenever the Explorer selection changes.
 showCopyMenu = function()
-	local inst = latestGui()
-	if not inst then
-		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
-		return
-	end
 	clearChildren(copyScroll)
 	copyMenuItems = {}
-	copyTitle.Text = "Copy Properties  —  " .. safeName(inst) .. " (" .. safeClass(inst) .. ")"
+	local inst = latestGui()
+	if not inst then
+		copyTitle.Text = "Select element to Copy from."
+		updateCopyCount()
+		copyOverlay.Visible = true
+		return
+	end
+	copyTitle.Text = "Copy : " .. safeName(inst) .. " (" .. safeClass(inst) .. ")"
 
-	local detected = detectProps(inst)
 	local order = 0
 	local lastCat = nil
-	for _, p in ipairs(detected) do
+	for _, p in ipairs(detectProps(inst)) do
 		if p.cat ~= lastCat then
 			order += 1
 			copyHeaderRow(p.cat, order)
@@ -812,9 +792,6 @@ showCopyMenu = function()
 		end
 		order += 1
 		table.insert(copyMenuItems, copyPropRow(p, order))
-	end
-	if #detected == 0 then
-		copyHeaderRow("No copyable properties detected on this element", 1)
 	end
 
 	updateCopyCount()
@@ -824,17 +801,13 @@ end
 
 copyConfirm.MouseButton1Click:Connect(function()
 	copied = {}
-	local n = 0
 	for _, item in ipairs(copyMenuItems) do
 		if item.checked then
 			copied[item.name] = item.value
-			n += 1
 		end
 	end
 	copyOverlay.Visible = false
-	print(string.format("[ExplorerFunctions] Copied %d propert%s.", n, n == 1 and "y" or "ies"))
 	if refreshTopbar then refreshTopbar() end
-	if refreshPage then refreshPage() end
 end)
 copyCloseBtn.MouseButton1Click:Connect(function() copyOverlay.Visible = false end)
 allBtn.MouseButton1Click:Connect(function() setAllChecked(true) end)
@@ -849,20 +822,20 @@ local swapOverlay = makeOverlay()
 local swapBar = Instance.new("Frame")
 swapBar.BackgroundColor3 = THEME.bar
 swapBar.BorderSizePixel = 0
-swapBar.Size = UDim2.new(1, 0, 0, 30)
+swapBar.Size = UDim2.new(1, 0, 0, TOPBAR_H)
 swapBar.ZIndex = 51
 swapBar.Parent = swapOverlay
 
 local swapTitle = Instance.new("TextLabel")
 swapTitle.BackgroundTransparency = 1
-swapTitle.Position = UDim2.new(0, 10, 0, 0)
-swapTitle.Size = UDim2.new(1, -80, 1, 0)
-swapTitle.Font = Enum.Font.GothamMedium
-swapTitle.TextSize = 13
+swapTitle.Position = UDim2.new(0, 8, 0, 0)
+swapTitle.Size = UDim2.new(1, -74, 1, 0)
+swapTitle.Font = Enum.Font.Gotham
+swapTitle.TextSize = 12
 swapTitle.TextColor3 = THEME.text
 swapTitle.TextXAlignment = Enum.TextXAlignment.Left
 swapTitle.TextTruncate = Enum.TextTruncate.AtEnd
-swapTitle.Text = "Swap Class"
+swapTitle.Text = "Swap"
 swapTitle.ZIndex = 52
 swapTitle.Parent = swapBar
 
@@ -880,8 +853,8 @@ local swapScroll = Instance.new("ScrollingFrame")
 swapScroll.BackgroundColor3 = THEME.bg
 swapScroll.BorderColor3 = THEME.border
 swapScroll.BorderSizePixel = 1
-swapScroll.Position = UDim2.new(0, 0, 0, 30)
-swapScroll.Size = UDim2.new(1, 0, 1, -30)
+swapScroll.Position = UDim2.new(0, 0, 0, TOPBAR_H)
+swapScroll.Size = UDim2.new(1, 0, 1, -TOPBAR_H)
 swapScroll.ClipsDescendants = true
 swapScroll.ScrollBarThickness = 8
 swapScroll.ScrollingDirection = Enum.ScrollingDirection.Y
@@ -893,81 +866,87 @@ do
 	local layout = Instance.new("UIListLayout")
 	layout.FillDirection = Enum.FillDirection.Vertical
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Padding = UDim.new(0, 3)
 	layout.Parent = swapScroll
 	local pad = Instance.new("UIPadding")
 	pad.PaddingTop = UDim.new(0, 6)
-	pad.PaddingLeft = UDim.new(0, 8)
-	pad.PaddingRight = UDim.new(0, 8)
-	pad.PaddingBottom = UDim.new(0, 10)
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.PaddingBottom = UDim.new(0, 12)
 	pad.Parent = swapScroll
 end
 
-local function swapClassRow(class, kept, total, order, inst)
-	local row = Instance.new("TextButton")
-	row.AutoButtonColor = false
-	row.BackgroundColor3 = THEME.rowHover
-	row.BackgroundTransparency = 1
-	row.BorderSizePixel = 0
-	row.Size = UDim2.new(1, 0, 0, 24)
-	row.Font = Enum.Font.Code
-	row.TextSize = 14
-	row.TextXAlignment = Enum.TextXAlignment.Left
-	row.TextColor3 = THEME.text
-	row.RichText = true
-	local hex = classColor(class)
-	local classTxt = escapeRich(class)
-	if hex then
-		classTxt = '<font color="' .. hex .. '">' .. classTxt .. "</font>"
-	end
-	row.Text = classTxt
-		.. ' <font color="' .. DIM_HEX .. '">—  keeps ' .. kept .. " / " .. total .. " properties</font>"
-	row.LayoutOrder = order
-	row.ZIndex = 52
-	do
-		local pad = Instance.new("UIPadding")
-		pad.PaddingLeft = UDim.new(0, 8)
-		pad.PaddingRight = UDim.new(0, 8)
-		pad.Parent = row
-	end
-	row.Parent = swapScroll
+-- One class option: [icon] ClassName. Class name is plain white; a transparent
+-- button on top handles hover + click so the icon/label show through beneath it.
+local function swapClassRow(class, order, inst)
+	local rowFrame = Instance.new("Frame")
+	rowFrame.BackgroundColor3 = THEME.rowHover
+	rowFrame.BackgroundTransparency = 1
+	rowFrame.BorderSizePixel = 0
+	rowFrame.Size = UDim2.new(1, 0, 0, 18)
+	rowFrame.LayoutOrder = order
+	rowFrame.ZIndex = 52
+	rowFrame.Parent = swapScroll
 
-	row.MouseEnter:Connect(function() row.BackgroundTransparency = 0 end)
-	row.MouseLeave:Connect(function() row.BackgroundTransparency = 1 end)
-	row.MouseButton1Click:Connect(function()
-		local newInst = performSwap(inst, class)
+	local icon = Instance.new("ImageLabel")
+	icon.BackgroundColor3 = THEME.btn
+	icon.BorderSizePixel = 0
+	icon.AnchorPoint = Vector2.new(0, 0.5)
+	icon.Position = UDim2.new(0, 1, 0.5, 0)
+	icon.Size = UDim2.new(0, 16, 0, 16)
+	icon.Image = SWAP_ICONS[class] or ""
+	icon.ZIndex = 52
+	do
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 3)
+		corner.Parent = icon
+	end
+	icon.Parent = rowFrame
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Position = UDim2.new(0, 22, 0, 0)
+	nameLabel.Size = UDim2.new(1, -22, 1, 0)
+	nameLabel.Font = Enum.Font.Code
+	nameLabel.TextSize = 14
+	nameLabel.TextColor3 = THEME.text
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.Text = class
+	nameLabel.ZIndex = 52
+	nameLabel.Parent = rowFrame
+
+	local clickBtn = Instance.new("TextButton")
+	clickBtn.BackgroundTransparency = 1
+	clickBtn.Text = ""
+	clickBtn.Size = UDim2.new(1, 0, 1, 0)
+	clickBtn.ZIndex = 53
+	clickBtn.Parent = rowFrame
+	clickBtn.MouseEnter:Connect(function() rowFrame.BackgroundTransparency = 0 end)
+	clickBtn.MouseLeave:Connect(function() rowFrame.BackgroundTransparency = 1 end)
+	clickBtn.MouseButton1Click:Connect(function()
+		performSwap(inst, class)
 		swapOverlay.Visible = false
-		if newInst then
-			print(string.format("[ExplorerFunctions] Swapped to %s (kept %d/%d properties).", class, kept, total))
-		end
-		if refreshPage then refreshPage() end
 		if refreshTopbar then refreshTopbar() end
 	end)
 end
 
+-- Build (or rebuild) the Swap menu for the current selection. Opens regardless
+-- of selection and re-runs live when the Explorer selection changes.
 showSwapMenu = function()
+	clearChildren(swapScroll)
 	local inst = latestGui()
 	if not inst then
-		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
+		swapTitle.Text = "Select element to Swap from."
+		swapOverlay.Visible = true
 		return
 	end
-	clearChildren(swapScroll)
-	swapTitle.Text = "Swap Class  —  " .. safeName(inst) .. " (" .. safeClass(inst) .. ")"
-
-	local snap = unionSnapshot(inst)
-	local total = 0
-	for _ in pairs(snap) do total += 1 end
+	swapTitle.Text = "Swap : " .. safeName(inst) .. " (" .. safeClass(inst) .. ")"
 
 	local curClass = safeClass(inst)
 	local order = 0
-	for _, class in ipairs(SWAP_CLASSES) do
+	for _, class in ipairs(SWAP_ORDER) do
 		if class ~= curClass then
-			local kept = 0
-			for name in pairs(snap) do
-				if classSupportsProp(class, name) then kept += 1 end
-			end
 			order += 1
-			swapClassRow(class, kept, total, order, inst)
+			swapClassRow(class, order, inst)
 		end
 	end
 
@@ -980,10 +959,6 @@ end
 --============================================================
 
 local function onCopy()
-	if not latestGui() then
-		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
-		return
-	end
 	showCopyMenu()
 end
 
@@ -994,21 +969,37 @@ local function onCopyStyle()
 		return
 	end
 	copied = {}
-	local n = 0
 	for _, p in ipairs(detectProps(inst)) do
 		if p.style then
 			copied[p.name] = p.value
-			n += 1
 		end
 	end
-	print(string.format("[ExplorerFunctions] Copied %d style propert%s from %s.", n, n == 1 and "y" or "ies", safeClass(inst)))
+	-- Also carry the Text, unless it's the default "Label" (which we never want).
+	local ok, txt = readProp(inst, "Text")
+	if ok and typeof(txt) == "string" and txt ~= "Label" then
+		copied.Text = txt
+	end
 	if refreshTopbar then refreshTopbar() end
-	if refreshPage then refreshPage() end
+end
+
+local function onCopyPos()
+	local inst = latestGui()
+	if not inst then
+		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
+		return
+	end
+	copied = {}
+	for _, p in ipairs(detectProps(inst)) do
+		if POS_SET[p.name] then
+			copied[p.name] = p.value
+		end
+	end
+	if refreshTopbar then refreshTopbar() end
 end
 
 local function onPaste()
 	if copiedCount() == 0 then
-		warn("[ExplorerFunctions] Nothing copied yet. Use Copy or Copy Style first.")
+		warn("[ExplorerFunctions] Nothing copied yet. Use Copy, Copy Style or Copy Pos first.")
 		return
 	end
 	local targets = currentSelection()
@@ -1016,22 +1007,14 @@ local function onPaste()
 		warn("[ExplorerFunctions] Select the element(s) to paste into.")
 		return
 	end
-	local totalApplied = 0
 	recorded("Paste properties", function()
 		for _, t in ipairs(targets) do
-			totalApplied += pasteInto(t)
+			pasteInto(t)
 		end
 	end)
-	print(string.format("[ExplorerFunctions] Pasted into %d element%s (%d properties applied).",
-		#targets, #targets == 1 and "" or "s", totalApplied))
-	if refreshPage then refreshPage() end
 end
 
 local function onSwap()
-	if not latestGui() then
-		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
-		return
-	end
 	showSwapMenu()
 end
 
@@ -1055,71 +1038,12 @@ TOOL_DEFS.ui_editor = {
 	name = "UI Editor",
 	buildTopbar = function()
 		return {
-			{ { text = "Copy", cb = onCopy }, { text = "Copy Style", cb = onCopyStyle } },
 			{ { text = pasteLabel(), cb = onPaste }, { text = "Swap", cb = onSwap } },
+			{ { text = "Copy", cb = onCopy }, { text = "Copy Style", cb = onCopyStyle }, { text = "Copy Pos", cb = onCopyPos } },
 		}
 	end,
-	renderPage = function(parent)
-		local holder = Instance.new("Frame")
-		holder.BackgroundTransparency = 1
-		holder.Size = UDim2.new(1, 0, 1, 0)
-		holder.Parent = parent
-		local layout = Instance.new("UIListLayout")
-		layout.FillDirection = Enum.FillDirection.Vertical
-		layout.SortOrder = Enum.SortOrder.LayoutOrder
-		layout.Padding = UDim.new(0, 6)
-		layout.Parent = holder
-		local pad = Instance.new("UIPadding")
-		pad.PaddingTop = UDim.new(0, 12)
-		pad.PaddingLeft = UDim.new(0, 12)
-		pad.PaddingRight = UDim.new(0, 12)
-		pad.Parent = holder
-
-		local function addLabel(order, text, font, size, color, wrapped)
-			local l = Instance.new("TextLabel")
-			l.BackgroundTransparency = 1
-			l.Size = UDim2.new(1, 0, 0, 0)
-			l.AutomaticSize = Enum.AutomaticSize.Y
-			l.Font = font
-			l.TextSize = size
-			l.TextColor3 = color
-			l.TextXAlignment = Enum.TextXAlignment.Left
-			l.TextYAlignment = Enum.TextYAlignment.Top
-			l.RichText = true
-			l.TextWrapped = wrapped == true
-			l.Text = text
-			l.LayoutOrder = order
-			l.Parent = holder
-			return l
-		end
-
-		-- Live selection status
-		local inst = latestSelected()
-		local selVal
-		if inst then
-			local nm = escapeRich(safeName(inst))
-			local cn = escapeRich(safeClass(inst))
-			if isA(inst, "GuiObject") then
-				selVal = nm .. ' <font color="' .. VALUE_HEX .. '">(' .. cn .. ")</font>"
-			else
-				selVal = nm .. " (" .. cn .. ') <font color="' .. WARN_HEX .. '">— not a UI element</font>'
-			end
-		else
-			selVal = '<font color="' .. DIM_HEX .. '">(nothing selected)</font>'
-		end
-
-		addLabel(1, "UI Editor", Enum.Font.GothamBold, 18, THEME.header)
-		addLabel(2, "Shortcut tools for editing UI elements.", Enum.Font.Gotham, 12, THEME.textDim, true)
-		addLabel(3, "<b>Selected:</b>  " .. selVal, Enum.Font.Gotham, 13, THEME.text, true)
-		addLabel(4, string.format('<b>Clipboard:</b>  %d propert%s copied', copiedCount(), copiedCount() == 1 and "y" or "ies"),
-			Enum.Font.Gotham, 13, THEME.text)
-		addLabel(5,
-			"Copy — pick which properties to copy from the selected element.\n"
-			.. "Copy Style — copy only appearance / text-style properties.\n"
-			.. "Paste — apply copied properties to the selected element(s).\n"
-			.. "Swap — change the element's class, keeping matching properties.",
-			Enum.Font.Gotham, 12, THEME.textDim, true)
-	end,
+	-- No page body for now (the area under the tab bar stays empty until a tool
+	-- needs it); tools that want a body can add a renderPage(parent) here later.
 }
 
 local function activeTool()
@@ -1247,10 +1171,11 @@ widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	if widget.Enabled then refreshAll() end
 end)
 
--- Keep the page's live selection readout in sync with the Explorer.
+-- While a menu is open, keep it pointed at the latest Explorer selection.
 Selection.SelectionChanged:Connect(function()
 	if not widget.Enabled then return end
-	refreshPage()
+	if copyOverlay.Visible then showCopyMenu() end
+	if swapOverlay.Visible then showSwapMenu() end
 end)
 
 --============================================================
