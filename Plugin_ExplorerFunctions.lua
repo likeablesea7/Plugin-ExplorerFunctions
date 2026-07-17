@@ -48,6 +48,7 @@ local PROP_CATALOG = {
 	}},
 	{ cat = "Transform", props = {
 		"Position", "Size", "AnchorPoint", "Rotation", "AutomaticSize", "SizeConstraint",
+		"Orientation", "CFrame",
 	}},
 	{ cat = "Layout & Visibility", props = {
 		"Visible", "ZIndex", "LayoutOrder", "ClipsDescendants",
@@ -90,6 +91,35 @@ local PROP_CATALOG = {
 	{ cat = "Viewport", style = true, props = {
 		"Ambient", "LightColor", "LightDirection",
 	}},
+
+	-- Non-UI (3D / physics) properties. These share the flat detect-by-read
+	-- mechanism, so any class exposing them (Part, MeshPart, Model, Attachment,
+	-- Weld, WeldConstraint, HingeConstraint, SpringConstraint, ...) picks them up.
+	{ cat = "Physics", props = {
+		"Anchored", "CanCollide", "CanTouch", "CanQuery", "Locked", "Massless", "CastShadow", "Shape",
+	}},
+	{ cat = "Surface", style = true, props = {
+		"Color", "Material", "MaterialVariant", "Transparency", "Reflectance",
+	}},
+	{ cat = "Mesh", props = {
+		"TextureID", "DoubleSided", "RenderFidelity", "CollisionFidelity",
+	}},
+	{ cat = "Model", props = {
+		"WorldPivot", "LevelOfDetail", "ModelStreamingMode",
+	}},
+	{ cat = "Attachment", props = {
+		"Axis", "SecondaryAxis",
+	}},
+	{ cat = "Joint", props = {
+		"C0", "C1",
+	}},
+	{ cat = "Constraint", props = {
+		"Enabled", "ActuatorType", "ActuatorRelativeTo", "LimitsEnabled", "Restitution",
+		"TargetAngle", "AngularSpeed", "MotorMaxTorque", "MotorMaxAcceleration", "ServoMaxTorque",
+		"LowerAngle", "UpperAngle",
+		"Stiffness", "Damping", "FreeLength", "MaxForce", "MaxLength", "MinLength",
+		"Coils", "Radius", "Thickness",
+	}},
 }
 
 -- Flatten into an ordered name list + info lookup. Applying / detecting in this
@@ -109,27 +139,26 @@ local POS_SET = {
 	AutomaticSize = true, SizeConstraint = true, LayoutOrder = true,
 }
 
--- Classes an element may be swapped into, ranked most-commonly-used first (this
--- is the top-to-bottom order in the Swap menu). The current class is skipped.
+-- Classes an element may be swapped into. This top-to-bottom order is the Swap
+-- menu's layout order; the current class is skipped.
 local SWAP_ORDER = {
-	"Frame", "ImageButton", "ScrollingFrame", "TextLabel", "TextBox",
-	"ImageLabel", "TextButton", "CanvasGroup", "ViewportFrame", "VideoFrame",
+	"Frame", "ScrollingFrame", "TextButton", "TextLabel", "TextBox",
+	"ImageLabel", "ImageButton", "CanvasGroup", "ViewportFrame", "VideoFrame",
 }
 
--- Icon image for each swap class, shown to the left of the class name. Set these
--- to your own rbxassetid://... values; an empty string shows a blank placeholder
--- box so you can fill the icons in later.
+-- Icon image for each swap class, shown to the left of the class name. An empty
+-- string shows a blank placeholder box; a set image hides that box.
 local SWAP_ICONS = {
-	Frame          = "",
-	ImageButton    = "",
-	ScrollingFrame = "",
-	TextLabel      = "",
-	TextBox        = "",
-	ImageLabel     = "",
-	TextButton     = "",
-	CanvasGroup    = "",
-	ViewportFrame  = "",
-	VideoFrame     = "",
+	Frame          = "rbxassetid://136745022842164",
+	ScrollingFrame = "rbxassetid://80832694523145",
+	TextButton     = "rbxassetid://130877948484472",
+	TextLabel      = "rbxassetid://77047417775689",
+	TextBox        = "rbxassetid://76155028129663",
+	ImageLabel     = "rbxassetid://75478228858323",
+	ImageButton    = "rbxassetid://136714409121667",
+	CanvasGroup    = "rbxassetid://79718291046627",
+	ViewportFrame  = "rbxassetid://128155805590911",
+	VideoFrame     = "rbxassetid://120956755659774",
 }
 
 --============================================================
@@ -142,6 +171,11 @@ local activeIndex = 1
 -- Copied property clipboard: { [propName] = value }. Session-only: never saved,
 -- so it is empty again after re-entering a session.
 local copied = {}
+
+-- Which property names were last ticked in the Copy menu (set on "Copy"). The
+-- menu opens with these pre-checked; empty at first, so the first open is all
+-- unchecked. Session-only.
+local copyChecked = {}
 
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
@@ -236,6 +270,10 @@ local function fmtValue(v)
 		return string.format("%s, %s, %s", numStr(v.X), numStr(v.Y), numStr(v.Z))
 	elseif t == "EnumItem" then
 		return v.Name
+	elseif t == "BrickColor" then
+		return v.Name
+	elseif t == "CFrame" then
+		return string.format("%s, %s, %s", numStr(v.X), numStr(v.Y), numStr(v.Z))
 	elseif t == "number" then
 		return numStr(v)
 	elseif t == "boolean" then
@@ -350,7 +388,10 @@ local function performSwap(oldInst, newClass)
 			pcall(function() child.Parent = newInst end)
 		end
 		newInst.Parent = parent
-		oldInst:Destroy()
+		-- Detach (don't Destroy) the old element: Destroy() locks its Parent and
+		-- makes Undo warn "Parent property is locked". Leaving it parentless keeps
+		-- the swap fully undoable; it's off the tree and gets collected.
+		oldInst.Parent = nil
 	end)
 	if newInst then
 		-- Carry the full union forward so a property this class couldn't hold can
@@ -672,9 +713,15 @@ copyCount.Parent = copyBottom
 
 local copyMenuItems = {} -- { name, value, checked, cb (checkbox), row }
 
--- Checked box uses the selected-tab blue (no checkmark icon); unchecked uses btn.
+-- Checked box uses the selected-tab blue with a checkmark; unchecked is blank.
 local function paintCheckbox(item)
-	item.cb.BackgroundColor3 = item.checked and THEME.rowSel or THEME.btn
+	if item.checked then
+		item.cb.BackgroundColor3 = THEME.rowSel
+		item.cb.Text = "✓"
+	else
+		item.cb.BackgroundColor3 = THEME.btn
+		item.cb.Text = ""
+	end
 end
 
 local function updateCopyCount()
@@ -732,7 +779,7 @@ local function copyPropRow(p, order)
 	end
 	row.Parent = copyScroll
 
-	-- Checkbox: styled like a selected tab button (blue when on), no checkmark.
+	-- Checkbox: styled like a selected tab button (blue when on) with a checkmark.
 	local cb = Instance.new("TextButton")
 	cb.AutoButtonColor = false
 	cb.AnchorPoint = Vector2.new(1, 0.5)
@@ -740,6 +787,9 @@ local function copyPropRow(p, order)
 	cb.Size = UDim2.new(0, 16, 0, 16)
 	cb.BackgroundColor3 = THEME.btn
 	cb.BorderSizePixel = 0
+	cb.Font = Enum.Font.GothamBold
+	cb.TextSize = 12
+	cb.TextColor3 = THEME.text
 	cb.Text = ""
 	cb.ZIndex = 53
 	do
@@ -749,7 +799,8 @@ local function copyPropRow(p, order)
 	end
 	cb.Parent = row
 
-	local item = { name = p.name, value = p.value, checked = true, cb = cb, row = row }
+	-- Default-checked from the remembered set (empty on first open = all off).
+	local item = { name = p.name, value = p.value, checked = copyChecked[p.name] == true, cb = cb, row = row }
 	local function toggle()
 		item.checked = not item.checked
 		paintCheckbox(item)
@@ -767,13 +818,13 @@ local function copyPropRow(p, order)
 	return item
 end
 
--- Build (or rebuild) the Copy menu for the current Explorer selection. Opens
--- regardless of selection; with nothing valid selected it shows a prompt and no
--- rows, and re-runs live whenever the Explorer selection changes.
+-- Build (or rebuild) the Copy menu for the current Explorer selection. Works on
+-- any instance (UI or 3D/physics), opens regardless of selection, and re-runs
+-- live whenever the Explorer selection changes.
 showCopyMenu = function()
 	clearChildren(copyScroll)
 	copyMenuItems = {}
-	local inst = latestGui()
+	local inst = latestSelected()
 	if not inst then
 		copyTitle.Text = "Select element to Copy from."
 		updateCopyCount()
@@ -801,9 +852,11 @@ end
 
 copyConfirm.MouseButton1Click:Connect(function()
 	copied = {}
+	copyChecked = {}
 	for _, item in ipairs(copyMenuItems) do
 		if item.checked then
 			copied[item.name] = item.value
+			copyChecked[item.name] = true -- remember for the next time the menu opens
 		end
 	end
 	copyOverlay.Visible = false
@@ -887,13 +940,16 @@ local function swapClassRow(class, order, inst)
 	rowFrame.ZIndex = 52
 	rowFrame.Parent = swapScroll
 
+	local img = SWAP_ICONS[class] or ""
 	local icon = Instance.new("ImageLabel")
 	icon.BackgroundColor3 = THEME.btn
+	-- Show the placeholder box only until a real icon is set.
+	icon.BackgroundTransparency = (img ~= "") and 1 or 0
 	icon.BorderSizePixel = 0
 	icon.AnchorPoint = Vector2.new(0, 0.5)
 	icon.Position = UDim2.new(0, 1, 0.5, 0)
 	icon.Size = UDim2.new(0, 16, 0, 16)
-	icon.Image = SWAP_ICONS[class] or ""
+	icon.Image = img
 	icon.ZIndex = 52
 	do
 		local corner = Instance.new("UICorner")
