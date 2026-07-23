@@ -184,7 +184,7 @@ local swapMemory = setmetatable({}, { __mode = "k" })
 
 -- forward declarations
 local refreshAll, refreshTabs, refreshTopbar, refreshPage, save
-local showCopyMenu, showSwapMenu
+local showCopyMenu, showSwapMenu, showLayoutOrderMenu
 
 --============================================================
 -- Safe accessors / selection
@@ -1011,6 +1011,219 @@ showSwapMenu = function()
 end
 
 --============================================================
+-- LayoutOrder overlay (gap-free list reordering)
+--============================================================
+
+-- Reorder one parent's GuiObject children: normalize their LayoutOrder to
+-- 0..n-1 (fixing gaps and ties from the current order), then move the selected
+-- subset as one gap-free group. mode: "left" (-1), "right" (+1), "min", "max".
+local function reorderParent(parent, selSet, mode)
+	local kids = {}
+	for i, c in ipairs(parent:GetChildren()) do
+		if isA(c, "GuiObject") then
+			table.insert(kids, { inst = c, ord = c.LayoutOrder, idx = i })
+		end
+	end
+	if #kids == 0 then return end
+	-- Current relative order = LayoutOrder, ties broken by Explorer child index.
+	table.sort(kids, function(a, b)
+		if a.ord ~= b.ord then return a.ord < b.ord end
+		return a.idx < b.idx
+	end)
+
+	local pos = {} -- inst -> normalized 0-based order
+	local U, S = {}, {} -- unselected / selected, each in normalized order
+	for i, k in ipairs(kids) do
+		pos[k.inst] = i - 1
+		if selSet[k.inst] then
+			table.insert(S, k.inst)
+		else
+			table.insert(U, k.inst)
+		end
+	end
+	if #S == 0 then return end
+
+	-- How many unselected elements sit before a given normalized order.
+	local function unselectedBefore(orderVal)
+		local c = 0
+		for _, u in ipairs(U) do
+			if pos[u] < orderVal then c += 1 end
+		end
+		return c
+	end
+
+	-- Insertion index of the selected group within the unselected sequence.
+	local idx
+	if mode == "left" then
+		idx = unselectedBefore(pos[S[1]]) - 1
+	elseif mode == "right" then
+		idx = unselectedBefore(pos[S[#S]]) + 1
+	elseif mode == "min" then
+		idx = 0
+	else -- "max"
+		idx = #U
+	end
+	idx = math.clamp(idx, 0, #U)
+
+	-- Rebuild the sibling order: unselected, with the selected block spliced in.
+	local final = {}
+	for i = 1, idx do table.insert(final, U[i]) end
+	for _, s in ipairs(S) do table.insert(final, s) end
+	for i = idx + 1, #U do table.insert(final, U[i]) end
+
+	for i, inst in ipairs(final) do
+		pcall(function() inst.LayoutOrder = i - 1 end)
+	end
+end
+
+-- Group the selected GuiObjects by parent, then reorder each parent's list.
+local function applyReorder(mode)
+	local byParent = {}
+	for _, inst in ipairs(currentSelection()) do
+		if isA(inst, "GuiObject") then
+			local p = safeParent(inst)
+			if p then
+				byParent[p] = byParent[p] or {}
+				byParent[p][inst] = true
+			end
+		end
+	end
+	if not next(byParent) then return end
+	recorded("Reorder LayoutOrder", function()
+		for parent, selSet in pairs(byParent) do
+			reorderParent(parent, selSet, mode)
+		end
+	end)
+end
+
+local loOverlay = makeOverlay()
+
+local loBar = Instance.new("Frame")
+loBar.BackgroundColor3 = THEME.bar
+loBar.BorderSizePixel = 0
+loBar.Size = UDim2.new(1, 0, 0, TOPBAR_H)
+loBar.ZIndex = 51
+loBar.Parent = loOverlay
+
+local loTitle = Instance.new("TextLabel")
+loTitle.BackgroundTransparency = 1
+loTitle.Position = UDim2.new(0, 8, 0, 0)
+loTitle.Size = UDim2.new(1, -74, 1, 0)
+loTitle.Font = Enum.Font.Gotham
+loTitle.TextSize = 12
+loTitle.TextColor3 = THEME.text
+loTitle.TextXAlignment = Enum.TextXAlignment.Left
+loTitle.TextTruncate = Enum.TextTruncate.AtEnd
+loTitle.Text = "LayoutOrder"
+loTitle.ZIndex = 52
+loTitle.Parent = loBar
+
+local loCloseBtn = createBtnVisual(loBar, "Close")
+loCloseBtn.AutomaticSize = Enum.AutomaticSize.None
+loCloseBtn.AnchorPoint = Vector2.new(1, 0.5)
+loCloseBtn.Position = UDim2.new(1, -6, 0.5, 0)
+loCloseBtn.Size = UDim2.new(0, 56, 0, 22)
+loCloseBtn.ZIndex = 52
+loCloseBtn.MouseEnter:Connect(function() loCloseBtn.BackgroundColor3 = THEME.btnHover end)
+loCloseBtn.MouseLeave:Connect(function() loCloseBtn.BackgroundColor3 = THEME.btn end)
+loCloseBtn.MouseButton1Click:Connect(function() loOverlay.Visible = false end)
+
+-- Blank main frame (same look as the Copy menu's list frame, but empty).
+local loBody = Instance.new("Frame")
+loBody.BackgroundColor3 = THEME.bg
+loBody.BorderColor3 = THEME.border
+loBody.BorderSizePixel = 1
+loBody.Position = UDim2.new(0, 0, 0, TOPBAR_H)
+loBody.Size = UDim2.new(1, 0, 1, -TOPBAR_H)
+loBody.ClipsDescendants = true
+loBody.ZIndex = 51
+loBody.Parent = loOverlay
+
+-- Top-center controls: row 1 = "< Left" / "Right >", row 2 = "Min" / "Max".
+local loButtons = Instance.new("Frame")
+loButtons.BackgroundTransparency = 1
+loButtons.AnchorPoint = Vector2.new(0.5, 0)
+loButtons.Position = UDim2.new(0.5, 0, 0, 12)
+loButtons.AutomaticSize = Enum.AutomaticSize.XY
+loButtons.Size = UDim2.new(0, 0, 0, 0)
+loButtons.ZIndex = 52
+loButtons.Parent = loBody
+do
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.Padding = UDim.new(0, 6)
+	layout.Parent = loButtons
+end
+
+local function loRow(order)
+	local r = Instance.new("Frame")
+	r.BackgroundTransparency = 1
+	r.AutomaticSize = Enum.AutomaticSize.XY
+	r.Size = UDim2.new(0, 0, 0, 0)
+	r.LayoutOrder = order
+	r.ZIndex = 52
+	r.Parent = loButtons
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 6)
+	layout.Parent = r
+	return r
+end
+
+local function loMakeButton(parent, text, order, mode)
+	local b = createBtnVisual(parent, text)
+	b.AutomaticSize = Enum.AutomaticSize.X
+	b.Size = UDim2.new(0, 0, 0, 22)
+	b.LayoutOrder = order
+	b.ZIndex = 52
+	b.MouseEnter:Connect(function() b.BackgroundColor3 = THEME.btnHover end)
+	b.MouseLeave:Connect(function() b.BackgroundColor3 = THEME.btn end)
+	b.MouseButton1Click:Connect(function()
+		local ok, err = pcall(function() applyReorder(mode) end)
+		if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
+	end)
+	return b
+end
+
+do
+	local row1 = loRow(1)
+	loMakeButton(row1, "< Left", 1, "left")
+	loMakeButton(row1, "Right >", 2, "right")
+	local row2 = loRow(2)
+	loMakeButton(row2, "Min", 1, "min")
+	loMakeButton(row2, "Max", 2, "max")
+end
+
+-- Selected instances that are UI elements (only these can be reordered).
+local function selectedGuis()
+	local out = {}
+	for _, inst in ipairs(currentSelection()) do
+		if isA(inst, "GuiObject") then table.insert(out, inst) end
+	end
+	return out
+end
+
+-- Open / refresh the LayoutOrder menu for the current selection.
+showLayoutOrderMenu = function()
+	local guis = selectedGuis()
+	local n = #guis
+	if n == 0 then
+		loTitle.Text = "Select List element to Reorder."
+		loButtons.Visible = false
+	elseif n == 1 then
+		loTitle.Text = "LayoutOrder : " .. safeName(guis[1]) .. " (" .. safeClass(guis[1]) .. ")"
+		loButtons.Visible = true
+	else
+		loTitle.Text = "LayoutOrder : ..."
+		loButtons.Visible = true
+	end
+	loOverlay.Visible = true
+end
+
+--============================================================
 -- Tool actions
 --============================================================
 
@@ -1074,6 +1287,10 @@ local function onSwap()
 	showSwapMenu()
 end
 
+local function onLayoutOrder()
+	showLayoutOrderMenu()
+end
+
 local function pasteLabel()
 	local n = copiedCount()
 	if n > 0 then return "Paste (" .. n .. ")" end
@@ -1094,7 +1311,7 @@ TOOL_DEFS.ui_editor = {
 	name = "UI Editor",
 	buildTopbar = function()
 		return {
-			{ { text = pasteLabel(), cb = onPaste }, { text = "Swap", cb = onSwap } },
+			{ { text = pasteLabel(), cb = onPaste }, { text = "Swap", cb = onSwap }, { text = "LayoutOrder", cb = onLayoutOrder } },
 			{ { text = "Copy", cb = onCopy }, { text = "Copy Style", cb = onCopyStyle }, { text = "Copy Pos", cb = onCopyPos } },
 		}
 	end,
@@ -1232,6 +1449,7 @@ Selection.SelectionChanged:Connect(function()
 	if not widget.Enabled then return end
 	if copyOverlay.Visible then showCopyMenu() end
 	if swapOverlay.Visible then showSwapMenu() end
+	if loOverlay.Visible then showLayoutOrderMenu() end
 end)
 
 --============================================================
