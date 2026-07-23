@@ -1173,7 +1173,29 @@ local function loRow(order)
 	return r
 end
 
-local function loMakeButton(parent, text, order, mode)
+-- Selected instances that are UI elements (only these can be reordered).
+local function selectedGuis()
+	local out = {}
+	for _, inst in ipairs(currentSelection()) do
+		if isA(inst, "GuiObject") then table.insert(out, inst) end
+	end
+	return out
+end
+
+-- Swap the LayoutOrder values of exactly two selected UI elements.
+local function swapOrders()
+	local guis = selectedGuis()
+	if #guis ~= 2 then
+		warn("[ExplorerFunctions] Select exactly 2 elements to swap their LayoutOrder.")
+		return
+	end
+	local a, b = guis[1], guis[2]
+	recorded("Swap LayoutOrder", function()
+		a.LayoutOrder, b.LayoutOrder = b.LayoutOrder, a.LayoutOrder
+	end)
+end
+
+local function loMakeButton(parent, text, order, cb)
 	local b = createBtnVisual(parent, text)
 	b.AutomaticSize = Enum.AutomaticSize.X
 	b.Size = UDim2.new(0, 0, 0, 22)
@@ -1182,7 +1204,7 @@ local function loMakeButton(parent, text, order, mode)
 	b.MouseEnter:Connect(function() b.BackgroundColor3 = THEME.btnHover end)
 	b.MouseLeave:Connect(function() b.BackgroundColor3 = THEME.btn end)
 	b.MouseButton1Click:Connect(function()
-		local ok, err = pcall(function() applyReorder(mode) end)
+		local ok, err = pcall(cb)
 		if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
 	end)
 	return b
@@ -1190,20 +1212,13 @@ end
 
 do
 	local row1 = loRow(1)
-	loMakeButton(row1, "< Left", 1, "left")
-	loMakeButton(row1, "Right >", 2, "right")
+	loMakeButton(row1, "< Left", 1, function() applyReorder("left") end)
+	loMakeButton(row1, "Right >", 2, function() applyReorder("right") end)
 	local row2 = loRow(2)
-	loMakeButton(row2, "Min", 1, "min")
-	loMakeButton(row2, "Max", 2, "max")
-end
-
--- Selected instances that are UI elements (only these can be reordered).
-local function selectedGuis()
-	local out = {}
-	for _, inst in ipairs(currentSelection()) do
-		if isA(inst, "GuiObject") then table.insert(out, inst) end
-	end
-	return out
+	loMakeButton(row2, "Min", 1, function() applyReorder("min") end)
+	loMakeButton(row2, "Max", 2, function() applyReorder("max") end)
+	local row3 = loRow(3)
+	loMakeButton(row3, "Swap", 1, function() swapOrders() end)
 end
 
 -- Open / refresh the LayoutOrder menu for the current selection.
