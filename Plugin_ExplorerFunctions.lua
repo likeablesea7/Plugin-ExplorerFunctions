@@ -178,8 +178,8 @@ local SWAP_ICONS = {
 	CanvasGroup    = "rbxassetid://79718291046627",
 	ViewportFrame  = "rbxassetid://128155805590911",
 	VideoFrame     = "rbxassetid://120956755659774",
-	UIListLayout   = "",
-	UIGridLayout   = "",
+	UIListLayout   = "rbxassetid://110871426007384",
+	UIGridLayout   = "rbxassetid://106105002721909",
 }
 
 --============================================================
