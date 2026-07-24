@@ -120,6 +120,19 @@ local PROP_CATALOG = {
 		"Stiffness", "Damping", "FreeLength", "MaxForce", "MaxLength", "MinLength",
 		"Coils", "Radius", "Thickness",
 	}},
+
+	-- Layout objects (UIListLayout / UIGridLayout). The "Layout" props are shared
+	-- by both, so they carry across a List<->Grid swap; the family-specific props
+	-- are kept in swap memory so a swap-back can restore them.
+	{ cat = "Layout", props = {
+		"FillDirection", "HorizontalAlignment", "VerticalAlignment", "SortOrder", "StartCorner",
+	}},
+	{ cat = "List Layout", props = {
+		"Padding", "ItemLineAlignment", "Wraps", "HorizontalFlex", "VerticalFlex",
+	}},
+	{ cat = "Grid Layout", props = {
+		"CellSize", "CellPadding", "FillDirectionMaxCells",
+	}},
 }
 
 -- Flatten into an ordered name list + info lookup. Applying / detecting in this
@@ -139,11 +152,17 @@ local POS_SET = {
 	AutomaticSize = true, SizeConstraint = true, LayoutOrder = true,
 }
 
--- Classes an element may be swapped into. This top-to-bottom order is the Swap
--- menu's layout order; the current class is skipped.
+-- Classes an element may be swapped into, per family. This top-to-bottom order is
+-- the Swap menu's layout order; the current class is skipped. A GuiObject swaps
+-- among UI element classes; a layout object (UIListLayout/UIGridLayout) swaps
+-- among layout classes.
 local SWAP_ORDER = {
 	"Frame", "ScrollingFrame", "TextButton", "TextLabel", "TextBox",
 	"ImageLabel", "ImageButton", "CanvasGroup", "ViewportFrame", "VideoFrame",
+}
+
+local SWAP_LAYOUT_ORDER = {
+	"UIListLayout", "UIGridLayout",
 }
 
 -- Icon image for each swap class, shown to the left of the class name. An empty
@@ -159,6 +178,8 @@ local SWAP_ICONS = {
 	CanvasGroup    = "rbxassetid://79718291046627",
 	ViewportFrame  = "rbxassetid://128155805590911",
 	VideoFrame     = "rbxassetid://120956755659774",
+	UIListLayout   = "",
+	UIGridLayout   = "",
 }
 
 --============================================================
@@ -985,11 +1006,25 @@ local function swapClassRow(class, order, inst)
 	end)
 end
 
+-- The latest selected swappable instance and the ordered target-class list for
+-- its family: GuiObjects swap among UI element classes; layout objects
+-- (UIListLayout / UIGridLayout / ...) swap among layout classes.
+local function latestSwapTarget()
+	local inst = latestSelected()
+	if not inst then return nil end
+	if isA(inst, "GuiObject") then
+		return inst, SWAP_ORDER
+	elseif isA(inst, "UIGridStyleLayout") then
+		return inst, SWAP_LAYOUT_ORDER
+	end
+	return nil
+end
+
 -- Build (or rebuild) the Swap menu for the current selection. Opens regardless
 -- of selection and re-runs live when the Explorer selection changes.
 showSwapMenu = function()
 	clearChildren(swapScroll)
-	local inst = latestGui()
+	local inst, classes = latestSwapTarget()
 	if not inst then
 		swapTitle.Text = "Select element to Swap from."
 		swapOverlay.Visible = true
@@ -999,7 +1034,7 @@ showSwapMenu = function()
 
 	local curClass = safeClass(inst)
 	local order = 0
-	for _, class in ipairs(SWAP_ORDER) do
+	for _, class in ipairs(classes) do
 		if class ~= curClass then
 			order += 1
 			swapClassRow(class, order, inst)
