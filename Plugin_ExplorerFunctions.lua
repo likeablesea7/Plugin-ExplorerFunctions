@@ -201,6 +201,14 @@ local copyChecked = {}
 -- Active nudge mode for the D-Pad on the UI Editor page: "Position" | "Size" | "Origin".
 local nudgeMode = "Position"
 
+-- "Hide Box" nudging: after a nudge, deselect the element so Studio's big
+-- selection outline stops covering small elements. The target is remembered so
+-- later nudges keep affecting it while it stays deselected.
+local nudgeTarget = {}        -- last-nudged elements, kept even while deselected
+local nudgeHideBox = false
+local nudgeStatusLabel        -- page label showing the armed target (set in renderPage)
+local updateNudgeStatus       -- forward-declared; refreshes nudgeStatusLabel
+
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
 -- that a previous swap's class couldn't hold, if a later class supports it.
@@ -1400,9 +1408,40 @@ local function nudgeInstance(inst, axis, dir)
 	end
 end
 
--- Nudge every selected UI element (one undo step for the whole press).
+local function stillValid(inst)
+	local ok, res = pcall(function() return inst.Parent ~= nil and inst:IsDescendantOf(game) end)
+	return ok and res
+end
+
+-- Targets for a nudge: the live UI selection if any, otherwise the remembered
+-- target (so nudging keeps working after "Hide Box" has deselected the element).
+local function resolveNudgeTargets()
+	local live = selectedGuis()
+	if #live > 0 then return live end
+	local kept = {}
+	for _, inst in ipairs(nudgeTarget) do
+		if isA(inst, "GuiObject") and stillValid(inst) then table.insert(kept, inst) end
+	end
+	return kept
+end
+
+updateNudgeStatus = function()
+	if not nudgeStatusLabel then return end
+	local t = resolveNudgeTargets()
+	if #t == 0 then
+		nudgeStatusLabel.Text = ""
+	elseif #t == 1 then
+		nudgeStatusLabel.Text = "Nudging: " .. safeName(t[1]) .. " (" .. safeClass(t[1]) .. ")"
+	else
+		nudgeStatusLabel.Text = "Nudging: " .. #t .. " elements"
+	end
+end
+
+-- Nudge every target (one undo step). In Hide Box mode the element is mutated
+-- through its stored reference (no need to re-select it) and then deselected, so
+-- the selection outline never covers it.
 local function doNudge(axis, dir)
-	local guis = selectedGuis()
+	local guis = resolveNudgeTargets()
 	if #guis == 0 then
 		warn("[ExplorerFunctions] Select a UI element to nudge.")
 		return
@@ -1412,6 +1451,11 @@ local function doNudge(axis, dir)
 			pcall(function() nudgeInstance(inst, axis, dir) end)
 		end
 	end)
+	nudgeTarget = guis -- remember for subsequent nudges (even once deselected)
+	if nudgeHideBox then
+		pcall(function() Selection:Set({}) end)
+	end
+	updateNudgeStatus()
 end
 
 --============================================================
@@ -1503,6 +1547,35 @@ TOOL_DEFS.ui_editor = {
 		addArrow("←", 0, 30, "x", -1)
 		addArrow("→", 60, 30, "x", 1)
 		addArrow("↓", 30, 60, "y", 1)
+
+		-- "Hide Box": deselect after nudging so the selection outline doesn't
+		-- cover small elements (the target stays armed via the status line below).
+		local hideToggle = makeToggle(parent, "Hide Box", function() return nudgeHideBox end, function()
+			nudgeHideBox = not nudgeHideBox
+			if not nudgeHideBox then
+				-- turning it off: re-select the armed target so selection is normal again
+				local t = resolveNudgeTargets()
+				if #t > 0 then pcall(function() Selection:Set(t) end) end
+			end
+			updateNudgeStatus()
+		end)
+		hideToggle.AutomaticSize = Enum.AutomaticSize.None
+		hideToggle.Position = UDim2.new(0, 12, 0, 100)
+		hideToggle.Size = UDim2.new(0, 96, 0, 24)
+
+		nudgeStatusLabel = Instance.new("TextLabel")
+		nudgeStatusLabel.BackgroundTransparency = 1
+		nudgeStatusLabel.Position = UDim2.new(0, 12, 0, 134)
+		nudgeStatusLabel.Size = UDim2.new(1, -24, 0, 34)
+		nudgeStatusLabel.Font = Enum.Font.Gotham
+		nudgeStatusLabel.TextSize = 12
+		nudgeStatusLabel.TextColor3 = THEME.textDim
+		nudgeStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+		nudgeStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+		nudgeStatusLabel.TextWrapped = true
+		nudgeStatusLabel.Text = ""
+		nudgeStatusLabel.Parent = parent
+		updateNudgeStatus()
 	end,
 }
 
@@ -1637,6 +1710,7 @@ Selection.SelectionChanged:Connect(function()
 	if copyOverlay.Visible then showCopyMenu() end
 	if swapOverlay.Visible then showSwapMenu() end
 	if loOverlay.Visible then showLayoutOrderMenu() end
+	if updateNudgeStatus then updateNudgeStatus() end
 end)
 
 --============================================================
