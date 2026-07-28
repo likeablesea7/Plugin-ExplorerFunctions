@@ -198,6 +198,9 @@ local copied = {}
 -- unchecked. Session-only.
 local copyChecked = {}
 
+-- Active nudge mode for the D-Pad on the UI Editor page: "Position" | "Size" | "Origin".
+local nudgeMode = "Position"
+
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
 -- that a previous swap's class couldn't hold, if a later class supports it.
@@ -1348,6 +1351,70 @@ local function pasteLabel()
 end
 
 --============================================================
+-- Nudge (D-Pad) — pixel/anchor nudging on the UI Editor page
+--============================================================
+
+-- Snap v to the next 0.5 grid line strictly in direction s (+1 up / -1 down).
+-- e.g. 0.1 with s=+1 -> 0.5 (not 0.6); a value already on the grid steps a full 0.5.
+local function snapHalf(v, s)
+	local k = v / 0.5
+	if s > 0 then
+		return (math.floor(k + 1e-6) + 1) * 0.5
+	else
+		return (math.ceil(k - 1e-6) - 1) * 0.5
+	end
+end
+
+-- Apply one nudge to a single element. axis = "x"/"y"; dir = +1 (right/down) or
+-- -1 (left/up). Only the offset (or anchor) of the pressed axis changes; scales
+-- and the other axis are left untouched.
+local function nudgeInstance(inst, axis, dir)
+	if nudgeMode == "Position" then
+		local p = inst.Position
+		if axis == "x" then
+			inst.Position = UDim2.new(p.X.Scale, p.X.Offset + dir, p.Y.Scale, p.Y.Offset)
+		else
+			inst.Position = UDim2.new(p.X.Scale, p.X.Offset, p.Y.Scale, p.Y.Offset + dir)
+		end
+	elseif nudgeMode == "Size" then
+		-- Grow when nudging away from the anchor, shrink when nudging toward it
+		-- (centered anchor: + direction grows).
+		local a = inst.AnchorPoint
+		local sz = inst.Size
+		local anc = (axis == "x") and a.X or a.Y
+		local awayDir = (anc < 0.5) and 1 or ((anc > 0.5) and -1 or 0)
+		local delta = (awayDir ~= 0) and (dir * awayDir) or dir
+		if axis == "x" then
+			inst.Size = UDim2.new(sz.X.Scale, sz.X.Offset + delta, sz.Y.Scale, sz.Y.Offset)
+		else
+			inst.Size = UDim2.new(sz.X.Scale, sz.X.Offset, sz.Y.Scale, sz.Y.Offset + delta)
+		end
+	elseif nudgeMode == "Origin" then
+		-- Move the AnchorPoint on a 0.5 grid, clamped to [0, 1].
+		local a = inst.AnchorPoint
+		if axis == "x" then
+			inst.AnchorPoint = Vector2.new(math.clamp(snapHalf(a.X, dir), 0, 1), a.Y)
+		else
+			inst.AnchorPoint = Vector2.new(a.X, math.clamp(snapHalf(a.Y, dir), 0, 1))
+		end
+	end
+end
+
+-- Nudge every selected UI element (one undo step for the whole press).
+local function doNudge(axis, dir)
+	local guis = selectedGuis()
+	if #guis == 0 then
+		warn("[ExplorerFunctions] Select a UI element to nudge.")
+		return
+	end
+	recorded("Nudge " .. nudgeMode, function()
+		for _, inst in ipairs(guis) do
+			pcall(function() nudgeInstance(inst, axis, dir) end)
+		end
+	end)
+end
+
+--============================================================
 -- Tools registry
 --   Each tab is a tool. buildTopbar() returns { row1, row2 } of button specs;
 --   renderPage(parent) draws the tool's page. Add tools here in the future.
@@ -1365,8 +1432,78 @@ TOOL_DEFS.ui_editor = {
 			{ { text = "Copy", cb = onCopy }, { text = "Copy Style", cb = onCopyStyle }, { text = "Copy Pos", cb = onCopyPos } },
 		}
 	end,
-	-- No page body for now (the area under the tab bar stays empty until a tool
-	-- needs it); tools that want a body can add a renderPage(parent) here later.
+	-- Page body: nudge controls. Left = mode column (Position / Size / Origin,
+	-- one active at a time); right = a D-Pad that nudges the selection.
+	renderPage = function(parent)
+		-- Mode column (top-left)
+		local modeHolder = Instance.new("Frame")
+		modeHolder.BackgroundTransparency = 1
+		modeHolder.Position = UDim2.new(0, 12, 0, 12)
+		modeHolder.Size = UDim2.new(0, 96, 0, 0)
+		modeHolder.AutomaticSize = Enum.AutomaticSize.Y
+		modeHolder.Parent = parent
+		do
+			local layout = Instance.new("UIListLayout")
+			layout.FillDirection = Enum.FillDirection.Vertical
+			layout.SortOrder = Enum.SortOrder.LayoutOrder
+			layout.Padding = UDim.new(0, 4)
+			layout.Parent = modeHolder
+		end
+
+		local modeBtns = {}
+		local function repaintModes()
+			for mode, b in pairs(modeBtns) do
+				b.BackgroundColor3 = (nudgeMode == mode) and THEME.rowSel or THEME.btn
+			end
+		end
+		local function addMode(text, order)
+			local b = createBtnVisual(modeHolder, text)
+			b.AutomaticSize = Enum.AutomaticSize.None
+			b.Size = UDim2.new(1, 0, 0, 24)
+			b.LayoutOrder = order
+			modeBtns[text] = b
+			b.MouseEnter:Connect(function()
+				if nudgeMode ~= text then b.BackgroundColor3 = THEME.btnHover end
+			end)
+			b.MouseLeave:Connect(repaintModes)
+			b.MouseButton1Click:Connect(function()
+				nudgeMode = text
+				repaintModes()
+			end)
+		end
+		addMode("Position", 1)
+		addMode("Size", 2)
+		addMode("Origin", 3)
+		repaintModes()
+
+		-- D-Pad (top-right)
+		local pad = Instance.new("Frame")
+		pad.BackgroundTransparency = 1
+		pad.AnchorPoint = Vector2.new(1, 0)
+		pad.Position = UDim2.new(1, -12, 0, 12)
+		pad.Size = UDim2.new(0, 88, 0, 88)
+		pad.Parent = parent
+
+		local function addArrow(text, x, y, axis, dir)
+			local b = createBtnVisual(pad, text)
+			b.AutomaticSize = Enum.AutomaticSize.None
+			b.Size = UDim2.new(0, 28, 0, 28)
+			b.Position = UDim2.new(0, x, 0, y)
+			b.TextSize = 16
+			local padChild = b:FindFirstChildOfClass("UIPadding")
+			if padChild then padChild:Destroy() end -- let the glyph center in the square
+			b.MouseEnter:Connect(function() b.BackgroundColor3 = THEME.btnHover end)
+			b.MouseLeave:Connect(function() b.BackgroundColor3 = THEME.btn end)
+			b.MouseButton1Click:Connect(function()
+				local ok, err = pcall(function() doNudge(axis, dir) end)
+				if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
+			end)
+		end
+		addArrow("↑", 30, 0, "y", -1)
+		addArrow("←", 0, 30, "x", -1)
+		addArrow("→", 60, 30, "x", 1)
+		addArrow("↓", 30, 60, "y", 1)
+	end,
 }
 
 local function activeTool()
