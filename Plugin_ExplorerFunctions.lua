@@ -201,11 +201,10 @@ local copyChecked = {}
 -- Active nudge mode for the D-Pad on the UI Editor page: "Position" | "Size" | "Origin".
 local nudgeMode = "Position"
 
--- "Hide Box" nudging: after a nudge, deselect the element so Studio's big
--- selection outline stops covering small elements. The target is remembered so
--- later nudges keep affecting it while it stays deselected.
-local nudgeTarget = {}        -- last-nudged elements, kept even while deselected
-local nudgeHideBox = false
+-- Hovering the D-Pad hides Studio's big selection outline: the current selection
+-- is armed as the nudge target and deselected while the cursor is over the pad,
+-- then re-selected on leave. Lets you nudge/preview small elements uncluttered.
+local nudgeTarget = {}        -- armed target (kept while deselected during hover)
 local nudgeStatusLabel        -- page label showing the armed target (set in renderPage)
 local updateNudgeStatus       -- forward-declared; refreshes nudgeStatusLabel
 
@@ -1429,7 +1428,7 @@ updateNudgeStatus = function()
 	if not nudgeStatusLabel then return end
 	local t = resolveNudgeTargets()
 	if #t == 0 then
-		nudgeStatusLabel.Text = ""
+		nudgeStatusLabel.Text = "Hover the D-Pad to hide the selection box."
 	elseif #t == 1 then
 		nudgeStatusLabel.Text = "Nudging: " .. safeName(t[1]) .. " (" .. safeClass(t[1]) .. ")"
 	else
@@ -1437,9 +1436,8 @@ updateNudgeStatus = function()
 	end
 end
 
--- Nudge every target (one undo step). In Hide Box mode the element is mutated
--- through its stored reference (no need to re-select it) and then deselected, so
--- the selection outline never covers it.
+-- Nudge every target (one undo step). While the cursor is over the D-Pad the
+-- element is already deselected, so it's mutated through its stored reference.
 local function doNudge(axis, dir)
 	local guis = resolveNudgeTargets()
 	if #guis == 0 then
@@ -1451,9 +1449,33 @@ local function doNudge(axis, dir)
 			pcall(function() nudgeInstance(inst, axis, dir) end)
 		end
 	end)
-	nudgeTarget = guis -- remember for subsequent nudges (even once deselected)
-	if nudgeHideBox then
+	nudgeTarget = guis -- keep armed for subsequent presses
+	updateNudgeStatus()
+end
+
+-- D-Pad hover: while the cursor is over the pad, hide Studio's selection outline
+-- by arming the current selection as the nudge target and deselecting it; restore
+-- the selection when the cursor leaves.
+local nudgeRestore = {} -- elements to re-select on hover-out
+
+local function beginNudgeHover()
+	local sel = selectedGuis()
+	if #sel > 0 then
+		nudgeTarget = sel
+		nudgeRestore = sel
 		pcall(function() Selection:Set({}) end)
+	end
+	updateNudgeStatus()
+end
+
+local function endNudgeHover()
+	if #nudgeRestore > 0 then
+		local kept = {}
+		for _, inst in ipairs(nudgeRestore) do
+			if stillValid(inst) then table.insert(kept, inst) end
+		end
+		nudgeRestore = {}
+		if #kept > 0 then pcall(function() Selection:Set(kept) end) end
 	end
 	updateNudgeStatus()
 end
@@ -1548,25 +1570,17 @@ TOOL_DEFS.ui_editor = {
 		addArrow("→", 60, 30, "x", 1)
 		addArrow("↓", 30, 60, "y", 1)
 
-		-- "Hide Box": deselect after nudging so the selection outline doesn't
-		-- cover small elements (the target stays armed via the status line below).
-		local hideToggle = makeToggle(parent, "Hide Box", function() return nudgeHideBox end, function()
-			nudgeHideBox = not nudgeHideBox
-			if not nudgeHideBox then
-				-- turning it off: re-select the armed target so selection is normal again
-				local t = resolveNudgeTargets()
-				if #t > 0 then pcall(function() Selection:Set(t) end) end
-			end
-			updateNudgeStatus()
-		end)
-		hideToggle.AutomaticSize = Enum.AutomaticSize.None
-		hideToggle.Position = UDim2.new(0, 12, 0, 100)
-		hideToggle.Size = UDim2.new(0, 96, 0, 24)
+		-- Hovering anywhere over the D-Pad hides Studio's selection outline (arms +
+		-- deselects the current selection); leaving re-selects it. Handlers live on
+		-- the container so moving between the arrow buttons doesn't re-trigger.
+		pad.Active = true
+		pad.MouseEnter:Connect(beginNudgeHover)
+		pad.MouseLeave:Connect(endNudgeHover)
 
 		nudgeStatusLabel = Instance.new("TextLabel")
 		nudgeStatusLabel.BackgroundTransparency = 1
-		nudgeStatusLabel.Position = UDim2.new(0, 12, 0, 134)
-		nudgeStatusLabel.Size = UDim2.new(1, -24, 0, 34)
+		nudgeStatusLabel.Position = UDim2.new(0, 12, 0, 108)
+		nudgeStatusLabel.Size = UDim2.new(1, -24, 0, 40)
 		nudgeStatusLabel.Font = Enum.Font.Gotham
 		nudgeStatusLabel.TextSize = 12
 		nudgeStatusLabel.TextColor3 = THEME.textDim
