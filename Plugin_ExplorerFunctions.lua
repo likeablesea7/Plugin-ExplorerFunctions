@@ -206,6 +206,7 @@ local nudgeMode = "Position"
 -- then re-selected on leave. Lets you nudge/preview small elements uncluttered.
 local nudgeTarget = {}        -- armed target (kept while deselected during hover)
 local nudgeInvert = false     -- UIPadding: subtract instead of add
+local nudgeUniform = false    -- Size: nudge both dimensions together
 local nudgeStatusLabel        -- page label showing the armed target (set in renderPage)
 local nudgeModeHolder         -- Position/Size/Origin column (set in renderPage)
 local nudgeInvertBtn          -- Invert toggle for UIPadding (set in renderPage)
@@ -1404,17 +1405,29 @@ local function nudgeInstance(inst, axis, dir)
 		end
 	elseif nudgeMode == "Size" then
 		-- Grow when nudging away from the anchor, shrink when nudging toward it
-		-- (centered anchor: + direction grows).
+		-- (centered anchor: + direction grows). A purely scale-based axis (offset
+		-- == 0) nudges by 0.01 scale; otherwise by 1 px. Uniform nudges both axes.
 		local a = inst.AnchorPoint
 		local sz = inst.Size
 		local anc = (axis == "x") and a.X or a.Y
 		local awayDir = (anc < 0.5) and 1 or ((anc > 0.5) and -1 or 0)
-		local delta = (awayDir ~= 0) and (dir * awayDir) or dir
-		if axis == "x" then
-			inst.Size = UDim2.new(sz.X.Scale, sz.X.Offset + delta, sz.Y.Scale, sz.Y.Offset)
-		else
-			inst.Size = UDim2.new(sz.X.Scale, sz.X.Offset, sz.Y.Scale, sz.Y.Offset + delta)
+		local sign = (awayDir ~= 0) and (dir * awayDir) or dir
+		local function bump(u)
+			if u.Offset == 0 then
+				local s = u.Scale + sign * 0.01
+				return UDim.new(math.floor(s * 10000 + 0.5) / 10000, 0)
+			end
+			return UDim.new(u.Scale, u.Offset + sign)
 		end
+		local nx, ny = sz.X, sz.Y
+		if nudgeUniform then
+			nx, ny = bump(sz.X), bump(sz.Y)
+		elseif axis == "x" then
+			nx = bump(sz.X)
+		else
+			ny = bump(sz.Y)
+		end
+		inst.Size = UDim2.new(nx.Scale, nx.Offset, ny.Scale, ny.Offset)
 	elseif nudgeMode == "Origin" then
 		-- Move the AnchorPoint on a 0.5 grid, clamped to [0, 1].
 		local a = inst.AnchorPoint
@@ -1467,7 +1480,7 @@ updateNudgeStatus = function()
 	if not nudgeStatusLabel then return end
 	local t = resolveNudgeTargets()
 	if #t == 0 then
-		nudgeStatusLabel.Text = "Hover the D-Pad to hide the selection box."
+		nudgeStatusLabel.Text = ""
 	elseif #t == 1 then
 		nudgeStatusLabel.Text = "Nudging: " .. safeName(t[1]) .. " (" .. safeClass(t[1]) .. ")"
 	else
@@ -1568,10 +1581,12 @@ TOOL_DEFS.ui_editor = {
 		end
 
 		local modeBtns = {}
+		local uniformBtn
 		local function repaintModes()
 			for mode, b in pairs(modeBtns) do
 				b.BackgroundColor3 = (nudgeMode == mode) and THEME.rowSel or THEME.btn
 			end
+			if uniformBtn then uniformBtn.Visible = (nudgeMode == "Size") end
 		end
 		local function addMode(text, order)
 			local b = createBtnVisual(modeHolder, text)
@@ -1590,7 +1605,26 @@ TOOL_DEFS.ui_editor = {
 		end
 		addMode("Position", 1)
 		addMode("Size", 2)
-		addMode("Origin", 3)
+		addMode("Origin", 4)
+
+		-- "Uniform" sub-button, sits below Size and only shows while Size mode is
+		-- active; when on, nudges apply to both dimensions at once.
+		uniformBtn = createBtnVisual(modeHolder, "Uniform")
+		uniformBtn.AutomaticSize = Enum.AutomaticSize.None
+		uniformBtn.Size = UDim2.new(1, 0, 0, 24)
+		uniformBtn.LayoutOrder = 3
+		local function paintUniform()
+			uniformBtn.BackgroundColor3 = nudgeUniform and THEME.rowSel or THEME.btn
+		end
+		uniformBtn.MouseEnter:Connect(function()
+			if not nudgeUniform then uniformBtn.BackgroundColor3 = THEME.btnHover end
+		end)
+		uniformBtn.MouseLeave:Connect(paintUniform)
+		uniformBtn.MouseButton1Click:Connect(function()
+			nudgeUniform = not nudgeUniform
+			paintUniform()
+		end)
+		paintUniform()
 		repaintModes()
 		nudgeModeHolder = modeHolder
 
