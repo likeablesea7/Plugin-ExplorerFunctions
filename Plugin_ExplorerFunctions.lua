@@ -205,8 +205,12 @@ local nudgeMode = "Position"
 -- is armed as the nudge target and deselected while the cursor is over the pad,
 -- then re-selected on leave. Lets you nudge/preview small elements uncluttered.
 local nudgeTarget = {}        -- armed target (kept while deselected during hover)
+local nudgeInvert = false     -- UIPadding: subtract instead of add
 local nudgeStatusLabel        -- page label showing the armed target (set in renderPage)
+local nudgeModeHolder         -- Position/Size/Origin column (set in renderPage)
+local nudgeInvertBtn          -- Invert toggle for UIPadding (set in renderPage)
 local updateNudgeStatus       -- forward-declared; refreshes nudgeStatusLabel
+local updateNudgePageMode     -- forward-declared; shows the mode column vs Invert
 
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
@@ -1376,6 +1380,21 @@ end
 -- -1 (left/up). Only the offset (or anchor) of the pressed axis changes; scales
 -- and the other axis are left untouched.
 local function nudgeInstance(inst, axis, dir)
+	if isA(inst, "UIPadding") then
+		-- Each direction grows the padding on the OPPOSITE edge (pressing a way
+		-- pushes the content that way): up->Bottom, down->Top, left->Right,
+		-- right->Left. Invert subtracts instead of adds.
+		local delta = nudgeInvert and -1 or 1
+		local prop
+		if axis == "x" then
+			prop = (dir > 0) and "PaddingLeft" or "PaddingRight"
+		else
+			prop = (dir > 0) and "PaddingTop" or "PaddingBottom"
+		end
+		local cur = inst[prop]
+		inst[prop] = UDim.new(cur.Scale, cur.Offset + delta)
+		return
+	end
 	if nudgeMode == "Position" then
 		local p = inst.Position
 		if axis == "x" then
@@ -1412,16 +1431,36 @@ local function stillValid(inst)
 	return ok and res
 end
 
--- Targets for a nudge: the live UI selection if any, otherwise the remembered
--- target (so nudging keeps working after "Hide Box" has deselected the element).
+-- Elements the nudge tool can act on: UI elements and UIPadding modifiers.
+local function isNudgeable(inst)
+	return isA(inst, "GuiObject") or isA(inst, "UIPadding")
+end
+
+local function selectedNudgeables()
+	local out = {}
+	for _, inst in ipairs(currentSelection()) do
+		if isNudgeable(inst) then table.insert(out, inst) end
+	end
+	return out
+end
+
+-- Targets for a nudge: the live selection if any, otherwise the remembered target
+-- (so nudging keeps working while a cursor-hover has the element deselected).
 local function resolveNudgeTargets()
-	local live = selectedGuis()
+	local live = selectedNudgeables()
 	if #live > 0 then return live end
 	local kept = {}
 	for _, inst in ipairs(nudgeTarget) do
-		if isA(inst, "GuiObject") and stillValid(inst) then table.insert(kept, inst) end
+		if isNudgeable(inst) and stillValid(inst) then table.insert(kept, inst) end
 	end
 	return kept
+end
+
+-- The active target's family decides the page controls: a UIPadding target shows
+-- the "Invert" button, everything else shows the Position/Size/Origin column.
+local function nudgeIsPadding()
+	local t = resolveNudgeTargets()
+	return #t > 0 and isA(t[#t], "UIPadding")
 end
 
 updateNudgeStatus = function()
@@ -1436,6 +1475,18 @@ updateNudgeStatus = function()
 	end
 end
 
+updateNudgePageMode = function()
+	if not nudgeModeHolder or not nudgeInvertBtn then return end
+	local pad = nudgeIsPadding()
+	nudgeModeHolder.Visible = not pad
+	nudgeInvertBtn.Visible = pad
+end
+
+local function nudgeUIRefresh()
+	updateNudgeStatus()
+	updateNudgePageMode()
+end
+
 -- Nudge every target (one undo step). While the cursor is over the D-Pad the
 -- element is already deselected, so it's mutated through its stored reference.
 local function doNudge(axis, dir)
@@ -1444,13 +1495,13 @@ local function doNudge(axis, dir)
 		warn("[ExplorerFunctions] Select a UI element to nudge.")
 		return
 	end
-	recorded("Nudge " .. nudgeMode, function()
+	recorded("Nudge " .. (nudgeIsPadding() and "Padding" or nudgeMode), function()
 		for _, inst in ipairs(guis) do
 			pcall(function() nudgeInstance(inst, axis, dir) end)
 		end
 	end)
 	nudgeTarget = guis -- keep armed for subsequent presses
-	updateNudgeStatus()
+	nudgeUIRefresh()
 end
 
 -- D-Pad hover: while the cursor is over the pad, hide Studio's selection outline
@@ -1459,13 +1510,13 @@ end
 local nudgeRestore = {} -- elements to re-select on hover-out
 
 local function beginNudgeHover()
-	local sel = selectedGuis()
+	local sel = selectedNudgeables()
 	if #sel > 0 then
 		nudgeTarget = sel
 		nudgeRestore = sel
 		pcall(function() Selection:Set({}) end)
 	end
-	updateNudgeStatus()
+	nudgeUIRefresh()
 end
 
 local function endNudgeHover()
@@ -1477,7 +1528,7 @@ local function endNudgeHover()
 		nudgeRestore = {}
 		if #kept > 0 then pcall(function() Selection:Set(kept) end) end
 	end
-	updateNudgeStatus()
+	nudgeUIRefresh()
 end
 
 --============================================================
@@ -1541,6 +1592,27 @@ TOOL_DEFS.ui_editor = {
 		addMode("Size", 2)
 		addMode("Origin", 3)
 		repaintModes()
+		nudgeModeHolder = modeHolder
+
+		-- Invert toggle (shown in place of the mode column when a UIPadding is the
+		-- target): flips padding nudges from +1 px to -1 px.
+		nudgeInvertBtn = createBtnVisual(parent, "Invert")
+		nudgeInvertBtn.AutomaticSize = Enum.AutomaticSize.None
+		nudgeInvertBtn.Position = UDim2.new(0, 12, 0, 12)
+		nudgeInvertBtn.Size = UDim2.new(0, 96, 0, 24)
+		nudgeInvertBtn.Visible = false
+		local function paintInvert()
+			nudgeInvertBtn.BackgroundColor3 = nudgeInvert and THEME.rowSel or THEME.btn
+		end
+		nudgeInvertBtn.MouseEnter:Connect(function()
+			if not nudgeInvert then nudgeInvertBtn.BackgroundColor3 = THEME.btnHover end
+		end)
+		nudgeInvertBtn.MouseLeave:Connect(paintInvert)
+		nudgeInvertBtn.MouseButton1Click:Connect(function()
+			nudgeInvert = not nudgeInvert
+			paintInvert()
+		end)
+		paintInvert()
 
 		-- D-Pad (top-right)
 		local pad = Instance.new("Frame")
@@ -1589,7 +1661,7 @@ TOOL_DEFS.ui_editor = {
 		nudgeStatusLabel.TextWrapped = true
 		nudgeStatusLabel.Text = ""
 		nudgeStatusLabel.Parent = parent
-		updateNudgeStatus()
+		nudgeUIRefresh()
 	end,
 }
 
@@ -1725,6 +1797,7 @@ Selection.SelectionChanged:Connect(function()
 	if swapOverlay.Visible then showSwapMenu() end
 	if loOverlay.Visible then showLayoutOrderMenu() end
 	if updateNudgeStatus then updateNudgeStatus() end
+	if updateNudgePageMode then updateNudgePageMode() end
 end)
 
 --============================================================
