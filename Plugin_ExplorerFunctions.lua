@@ -150,6 +150,7 @@ end
 local POS_SET = {
 	Position = true, Size = true, AnchorPoint = true, Rotation = true,
 	AutomaticSize = true, SizeConstraint = true, LayoutOrder = true,
+	Orientation = true, CFrame = true, -- BaseParts (Part / MeshPart)
 }
 
 -- Classes an element may be swapped into, per family. This top-to-bottom order is
@@ -212,6 +213,7 @@ local nudgeModeHolder         -- Position/Size/Origin column (set in renderPage)
 local nudgeInvertBtn          -- Invert toggle for UIPadding (set in renderPage)
 local updateNudgeStatus       -- forward-declared; refreshes nudgeStatusLabel
 local updateNudgePageMode     -- forward-declared; shows the mode column vs Invert
+local nudgeRelayout           -- forward-declared; keeps the label below the controls
 
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
@@ -263,6 +265,16 @@ end
 local function latestGui()
 	local inst = latestSelected()
 	if inst and isA(inst, "GuiObject") then
+		return inst
+	end
+	return nil
+end
+
+-- Last selected instance if Copy Style / Copy Pos can read it: a UI element or a
+-- BasePart (Part, MeshPart, ...).
+local function latestCopyable()
+	local inst = latestSelected()
+	if inst and (isA(inst, "GuiObject") or isA(inst, "BasePart")) then
 		return inst
 	end
 	return nil
@@ -1297,9 +1309,9 @@ local function onCopy()
 end
 
 local function onCopyStyle()
-	local inst = latestGui()
+	local inst = latestCopyable()
 	if not inst then
-		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
+		warn("[ExplorerFunctions] Select a UI element or Part in the Explorer first.")
 		return
 	end
 	copied = {}
@@ -1317,9 +1329,9 @@ local function onCopyStyle()
 end
 
 local function onCopyPos()
-	local inst = latestGui()
+	local inst = latestCopyable()
 	if not inst then
-		warn("[ExplorerFunctions] Select a UI element in the Explorer first.")
+		warn("[ExplorerFunctions] Select a UI element or Part in the Explorer first.")
 		return
 	end
 	copied = {}
@@ -1493,6 +1505,23 @@ updateNudgePageMode = function()
 	local pad = nudgeIsPadding()
 	nudgeModeHolder.Visible = not pad
 	nudgeInvertBtn.Visible = pad
+	if nudgeRelayout then nudgeRelayout() end
+end
+
+-- Keep the "Nudging:" label just below whichever left block is showing (the mode
+-- column is one row taller in Size mode because of the Uniform sub-button) and
+-- below the D-Pad, so nothing overlaps. Mirrors the button metrics (24 h, 4 gap).
+nudgeRelayout = function()
+	if not nudgeStatusLabel then return end
+	local blockBottom
+	if nudgeInvertBtn and nudgeInvertBtn.Visible then
+		blockBottom = 12 + 24 -- single Invert button
+	else
+		local n = (nudgeMode == "Size") and 4 or 3
+		blockBottom = 12 + (n * 24 + (n - 1) * 4)
+	end
+	local y = math.max(blockBottom, 12 + 88) + 10 -- 12 + 88 = D-Pad bottom
+	nudgeStatusLabel.Position = UDim2.new(0, 12, 0, y)
 end
 
 local function nudgeUIRefresh()
@@ -1587,6 +1616,7 @@ TOOL_DEFS.ui_editor = {
 				b.BackgroundColor3 = (nudgeMode == mode) and THEME.rowSel or THEME.btn
 			end
 			if uniformBtn then uniformBtn.Visible = (nudgeMode == "Size") end
+			if nudgeRelayout then nudgeRelayout() end
 		end
 		local function addMode(text, order)
 			local b = createBtnVisual(modeHolder, text)
