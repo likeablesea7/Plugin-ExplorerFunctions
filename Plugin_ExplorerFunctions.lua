@@ -95,13 +95,16 @@ local PROP_CATALOG = {
 	-- Non-UI (3D / physics) properties. These share the flat detect-by-read
 	-- mechanism, so any class exposing them (Part, MeshPart, Model, Attachment,
 	-- Weld, WeldConstraint, HingeConstraint, SpringConstraint, ...) picks them up.
-	{ cat = "Physics", props = {
+	-- Physics / Surface / Mesh count as "style" for Copy Style: for a Part/MeshPart
+	-- everything except its transform (Position / Size / CFrame / Orientation) is
+	-- copied.
+	{ cat = "Physics", style = true, props = {
 		"Anchored", "CanCollide", "CanTouch", "CanQuery", "Locked", "Massless", "CastShadow", "Shape",
 	}},
 	{ cat = "Surface", style = true, props = {
 		"Color", "Material", "MaterialVariant", "Transparency", "Reflectance",
 	}},
-	{ cat = "Mesh", props = {
+	{ cat = "Mesh", style = true, props = {
 		"TextureID", "DoubleSided", "RenderFidelity", "CollisionFidelity",
 	}},
 	{ cat = "Model", props = {
