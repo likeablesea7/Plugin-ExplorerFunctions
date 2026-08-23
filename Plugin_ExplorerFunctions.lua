@@ -217,6 +217,7 @@ local nudgeInvertBtn          -- Invert toggle for UIPadding (set in renderPage)
 local updateNudgeStatus       -- forward-declared; refreshes nudgeStatusLabel
 local updateNudgePageMode     -- forward-declared; shows the mode column vs Invert
 local nudgeRelayout           -- forward-declared; keeps the label below the controls
+local endNudgeHover           -- forward-declared; restores a hover-hidden selection
 
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
@@ -1308,6 +1309,7 @@ end
 --============================================================
 
 local function onCopy()
+	if endNudgeHover then endNudgeHover() end -- restore any hover-hidden selection first
 	showCopyMenu()
 end
 
@@ -1364,10 +1366,12 @@ local function onPaste()
 end
 
 local function onSwap()
+	if endNudgeHover then endNudgeHover() end -- restore any hover-hidden selection first
 	showSwapMenu()
 end
 
 local function onLayoutOrder()
+	if endNudgeHover then endNudgeHover() end -- restore any hover-hidden selection first
 	showLayoutOrderMenu()
 end
 
@@ -1554,7 +1558,18 @@ end
 -- the selection when the cursor leaves.
 local nudgeRestore = {} -- elements to re-select on hover-out
 
+-- The D-Pad only exists on the (visible) UI Editor page. When an overlay/menu is
+-- open or the widget is closed, the page is covered but the pad's hover events can
+-- still fire underneath - so the hover-hide is gated on the page being active.
+local function nudgePageActive()
+	return widget.Enabled
+		and not copyOverlay.Visible
+		and not swapOverlay.Visible
+		and not loOverlay.Visible
+end
+
 local function beginNudgeHover()
+	if not nudgePageActive() then return end
 	local sel = selectedNudgeables()
 	if #sel > 0 then
 		nudgeTarget = sel
@@ -1564,7 +1579,7 @@ local function beginNudgeHover()
 	nudgeUIRefresh()
 end
 
-local function endNudgeHover()
+endNudgeHover = function()
 	if #nudgeRestore > 0 then
 		local kept = {}
 		for _, inst in ipairs(nudgeRestore) do
@@ -1827,6 +1842,9 @@ refreshTabs = function()
 end
 
 refreshPage = function()
+	-- Rebuilding destroys the D-Pad, so restore any hover-hidden selection first
+	-- (its MouseLeave would otherwise never fire).
+	if endNudgeHover then endNudgeHover() end
 	clearChildren(pageArea)
 	local tool = activeTool()
 	if tool and tool.renderPage then
@@ -1854,7 +1872,11 @@ end)
 
 widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	toggleButton:SetActive(widget.Enabled)
-	if widget.Enabled then refreshAll() end
+	if widget.Enabled then
+		refreshAll()
+	elseif endNudgeHover then
+		endNudgeHover() -- panel closed: don't leave a hover-hidden selection stuck
+	end
 end)
 
 -- While a menu is open, keep it pointed at the latest Explorer selection.
