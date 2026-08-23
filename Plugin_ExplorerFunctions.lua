@@ -5,6 +5,7 @@ end
 local Selection = game:GetService("Selection")
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local UserInputService = game:GetService("UserInputService")
 
 --============================================================
 -- Config / Theme
@@ -218,6 +219,13 @@ local updateNudgeStatus       -- forward-declared; refreshes nudgeStatusLabel
 local updateNudgePageMode     -- forward-declared; shows the mode column vs Invert
 local nudgeRelayout           -- forward-declared; keeps the label below the controls
 local endNudgeHover           -- forward-declared; restores a hover-hidden selection
+
+-- Viewport Editor state.
+local viewportTarget = {}     -- armed ViewportFrames (kept while deselected during hover)
+local viewportRestore = {}    -- ViewportFrames to re-select on hover-out
+local viewportClip = nil      -- copied camera { cframe, fov }
+local updateViewportUI        -- forward-declared; rebuilds the Viewport page for the selection
+local endViewportHover        -- forward-declared; restores a hover-hidden selection
 
 -- Swap memory: instance -> full property snapshot ever seen for that logical
 -- element. Weak keys so destroyed elements drop out. Lets us restore a property
@@ -621,6 +629,203 @@ local function clearChildren(guiObj)
 	for _, child in ipairs(guiObj:GetChildren()) do
 		if child:IsA("GuiObject") then child:Destroy() end
 	end
+end
+
+-- Themed slider: [label] [value TextBox] [track+fill+handle]. Dragging the handle
+-- follows the cursor left/right even past the track (via UserInputService) until
+-- the mouse button is released. The value TextBox is transparent and selects all
+-- on focus for quick manual entry.
+--
+-- cfg = { label, min, max, default, decimals, onChange(newValue, oldValue),
+--         onDragStart(), onDragEnd(), onHoverStart(), onHoverEnd() }
+-- Returns a controller: { row, setValue(v) }  (setValue never fires onChange).
+local function makeSlider(parent, order, cfg)
+	local decimals = cfg.decimals or 0
+	local function fmt(v)
+		if decimals <= 0 then
+			return tostring(math.floor(v + 0.5))
+		end
+		local m = 10 ^ decimals
+		return tostring(math.floor(v * m + 0.5) / m)
+	end
+
+	local value = cfg.default or cfg.min
+
+	local row = Instance.new("Frame")
+	row.BackgroundTransparency = 1
+	row.Size = UDim2.new(1, 0, 0, 22)
+	row.LayoutOrder = order
+	row.Parent = parent
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Position = UDim2.new(0, 0, 0, 0)
+	label.Size = UDim2.new(0, 44, 1, 0)
+	label.Font = Enum.Font.Gotham
+	label.TextSize = 12
+	label.TextColor3 = THEME.textDim
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Text = cfg.label
+	label.Parent = row
+
+	local box = Instance.new("TextBox")
+	box.BackgroundTransparency = 1
+	box.BorderSizePixel = 0
+	box.Position = UDim2.new(0, 46, 0, 0)
+	box.Size = UDim2.new(0, 48, 1, 0)
+	box.Font = Enum.Font.Code
+	box.TextSize = 13
+	box.TextColor3 = THEME.text
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	box.ClearTextOnFocus = false
+	box.Text = fmt(value)
+	box.Parent = row
+
+	local track = Instance.new("Frame")
+	track.BackgroundColor3 = THEME.btn
+	track.BorderSizePixel = 0
+	track.Active = true -- receive MouseButton1 InputBegan for dragging
+	track.AnchorPoint = Vector2.new(0, 0.5)
+	track.Position = UDim2.new(0, 100, 0.5, 0)
+	track.Size = UDim2.new(1, -104, 0, 6)
+	track.Parent = row
+	do
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(1, 0)
+		c.Parent = track
+	end
+
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = THEME.rowSel
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.Parent = track
+	do
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(1, 0)
+		c.Parent = fill
+	end
+
+	local handle = Instance.new("Frame")
+	handle.BackgroundColor3 = THEME.text
+	handle.BorderSizePixel = 0
+	handle.AnchorPoint = Vector2.new(0.5, 0.5)
+	handle.Size = UDim2.new(0, 12, 0, 12)
+	handle.ZIndex = 2
+	handle.Parent = track
+	do
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(1, 0)
+		c.Parent = handle
+	end
+
+	-- Transparent full-height hit area over the track column, so the thin track is
+	-- still easy to grab. Shares the track's x-range for value mapping.
+	local hit = Instance.new("TextButton")
+	hit.BackgroundTransparency = 1
+	hit.Text = ""
+	hit.AutoButtonColor = false
+	hit.Position = UDim2.new(0, 100, 0, 0)
+	hit.Size = UDim2.new(1, -104, 1, 0)
+	hit.ZIndex = 3
+	hit.Parent = row
+
+	local function paint()
+		local span = cfg.max - cfg.min
+		local rel = (span ~= 0) and math.clamp((value - cfg.min) / span, 0, 1) or 0
+		handle.Position = UDim2.new(rel, 0, 0.5, 0)
+		fill.Size = UDim2.new(rel, 0, 1, 0)
+	end
+
+	-- Display the true value even if it's outside the slider's range; paint() pins
+	-- the handle at the end. Dragging stays in range (valueFromX clamps); typing a
+	-- value into the box may go beyond it.
+	local function setValue(v) -- external: never fires onChange
+		value = v
+		box.Text = fmt(value)
+		paint()
+	end
+
+	local function apply(v) -- internal: fires onChange with the (new, old) values
+		local old = value
+		value = v
+		box.Text = fmt(value)
+		paint()
+		if v ~= old and cfg.onChange then cfg.onChange(v, old) end
+	end
+
+	local function valueFromX(px)
+		local rel = math.clamp((px - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
+		return cfg.min + rel * (cfg.max - cfg.min)
+	end
+
+	local dragging, hovering, moveConn, endConn = false, false, nil, nil
+	local function hoverStart() if cfg.onHoverStart then cfg.onHoverStart() end end
+	local function hoverEnd() if cfg.onHoverEnd then cfg.onHoverEnd() end end
+	local function stopDrag()
+		dragging = false
+		if moveConn then moveConn:Disconnect(); moveConn = nil end
+		if endConn then endConn:Disconnect(); endConn = nil end
+		if cfg.onDragEnd then cfg.onDragEnd() end
+		-- cursor may have left the row during the drag; restore only if it did
+		if not hovering then hoverEnd() end
+	end
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		dragging = true
+		hoverStart() -- ensure the selection stays hidden through the drag
+		if cfg.onDragStart then cfg.onDragStart() end
+		apply(valueFromX(input.Position.X))
+		moveConn = UserInputService.InputChanged:Connect(function(inp)
+			if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
+				apply(valueFromX(inp.Position.X))
+			end
+		end)
+		endConn = UserInputService.InputEnded:Connect(function(inp)
+			if inp.UserInputType == Enum.UserInputType.MouseButton1 then stopDrag() end
+		end)
+	end)
+	-- clean up if the slider is destroyed mid-drag (e.g. tab switch)
+	row.Destroying:Connect(function()
+		if dragging then stopDrag() end
+	end)
+
+	-- Hover over the whole row hides the Studio selection box (like the D-Pad).
+	-- While dragging, leaving the row must NOT restore it (the drag continues).
+	row.Active = true
+	row.MouseEnter:Connect(function()
+		hovering = true
+		hoverStart()
+	end)
+	row.MouseLeave:Connect(function()
+		hovering = false
+		if not dragging then hoverEnd() end
+	end)
+
+	box.Focused:Connect(function()
+		task.defer(function()
+			box.CursorPosition = #box.Text + 1
+			box.SelectionStart = 1
+		end)
+	end)
+	box.FocusLost:Connect(function()
+		local n = tonumber(box.Text)
+		if n then
+			apply(n)
+		else
+			box.Text = fmt(value)
+		end
+	end)
+
+	-- Recenter the draggable span (for unbounded quantities like distance/position),
+	-- keeping the displayed value; the handle then sits mid-track.
+	local function setRange(mn, mx)
+		cfg.min, cfg.max = mn, mx
+		paint()
+	end
+
+	setValue(value)
+	return { row = row, setValue = setValue, setRange = setRange }
 end
 
 --============================================================
@@ -1592,13 +1797,260 @@ endNudgeHover = function()
 end
 
 --============================================================
+-- Viewport Editor
+--   Orbit-camera model: the plugin owns each ViewportFrame's orbit params
+--   (yaw/pitch/roll/distance/pivot, stored as attributes) and derives the
+--   Camera.CFrame from them. Nothing about the contained parts is ever changed.
+--============================================================
+
+local FOV_DEFAULT = 70
+
+local function selectedViewports()
+	local out = {}
+	for _, inst in ipairs(currentSelection()) do
+		if isA(inst, "ViewportFrame") then table.insert(out, inst) end
+	end
+	return out
+end
+
+-- Live selection if any, else the armed target (kept while a hover deselected it).
+local function resolveViewportTargets()
+	local live = selectedViewports()
+	if #live > 0 then return live end
+	local kept = {}
+	for _, vf in ipairs(viewportTarget) do
+		if isA(vf, "ViewportFrame") and vf.Parent and vf:IsDescendantOf(game) then
+			table.insert(kept, vf)
+		end
+	end
+	return kept
+end
+
+-- Center + bounding-sphere radius of the parts the ViewportFrame renders.
+-- Falls back to a 2x2x2 box at the origin.
+local function subjectBounds(vf)
+	local minV, maxV
+	for _, d in ipairs(vf:GetDescendants()) do
+		if d:IsA("BasePart") then
+			pcall(function()
+				local lo = d.Position - d.Size * 0.5
+				local hi = d.Position + d.Size * 0.5
+				minV = minV and Vector3.new(math.min(minV.X, lo.X), math.min(minV.Y, lo.Y), math.min(minV.Z, lo.Z)) or lo
+				maxV = maxV and Vector3.new(math.max(maxV.X, hi.X), math.max(maxV.Y, hi.Y), math.max(maxV.Z, hi.Z)) or hi
+			end)
+		end
+	end
+	if not minV then
+		return Vector3.new(0, 0, 0), math.sqrt(3)
+	end
+	local center = (minV + maxV) * 0.5
+	local radius = (maxV - center).Magnitude
+	if radius < 0.05 then radius = math.sqrt(3) end
+	return center, radius
+end
+
+-- Distance that comfortably frames a bounding sphere of `radius` at the given FOV.
+local function frameDistance(radius, fov)
+	return (radius / math.max(0.087, math.sin(math.rad(fov * 0.5)))) * 1.25
+end
+
+-- Camera CFrame from orbit params: yaw around world Y, pitch elevation, then roll
+-- about the look axis; camera sits `distance` from `pivot` and looks at it.
+local function orbitToCFrame(pivot, distance, yaw, pitch, roll)
+	distance = math.max(0.05, distance) -- keep camera off the pivot so lookAt is valid
+	local dir = CFrame.fromEulerAnglesYXZ(math.rad(pitch), math.rad(yaw), 0)
+	local camPos = pivot + dir * Vector3.new(0, 0, distance)
+	return CFrame.lookAt(camPos, pivot) * CFrame.Angles(0, 0, math.rad(roll))
+end
+
+local function getOrbit(vf)
+	return {
+		yaw = vf:GetAttribute("VE_Yaw") or 0,
+		pitch = vf:GetAttribute("VE_Pitch") or 0,
+		roll = vf:GetAttribute("VE_Roll") or 0,
+		distance = vf:GetAttribute("VE_Distance") or frameDistance(math.sqrt(3), FOV_DEFAULT),
+		pivot = vf:GetAttribute("VE_Pivot") or Vector3.new(0, 0, 0),
+	}
+end
+
+local function writeOrbit(vf, o)
+	vf:SetAttribute("VE_Yaw", o.yaw)
+	vf:SetAttribute("VE_Pitch", o.pitch)
+	vf:SetAttribute("VE_Roll", o.roll)
+	vf:SetAttribute("VE_Distance", o.distance)
+	vf:SetAttribute("VE_Pivot", o.pivot)
+end
+
+-- Push an orbit table to the camera, and co-rotate LightDirection by the camera's
+-- rotation change so lighting stays relative to the view (only rotation changes
+-- the camera's orientation, so only Roll/Pitch/Yaw move the light).
+local function applyOrbit(vf, o)
+	local cam = vf.CurrentCamera
+	if not cam then return end
+	local oldCF = cam.CFrame
+	local newCF = orbitToCFrame(o.pivot, o.distance, o.yaw, o.pitch, o.roll)
+	cam.CFrame = newCF
+	local dR = newCF.Rotation * oldCF.Rotation:Inverse()
+	local ok, dir = pcall(function() return vf.LightDirection end)
+	if ok and typeof(dir) == "Vector3" and dir.Magnitude > 1e-4 then
+		pcall(function() vf.LightDirection = dR * dir end)
+	end
+	writeOrbit(vf, o)
+end
+
+-- Default preset: front-on, framed so a 2x2x2 box (or the actual contents) fits.
+local function initOrbit(vf)
+	local center, radius = subjectBounds(vf)
+	local o = { yaw = 0, pitch = 0, roll = 0, distance = frameDistance(radius, FOV_DEFAULT), pivot = center }
+	if vf.CurrentCamera then
+		vf.CurrentCamera.FieldOfView = FOV_DEFAULT
+		vf.CurrentCamera.CFrame = orbitToCFrame(o.pivot, o.distance, o.yaw, o.pitch, o.roll)
+	end
+	writeOrbit(vf, o)
+	return o
+end
+
+--------------------------------------------------------------
+-- Button actions
+--------------------------------------------------------------
+
+local function onAddCamera()
+	local vfs = resolveViewportTargets()
+	if #vfs == 0 then return end
+	recorded("Add viewport camera", function()
+		for _, vf in ipairs(vfs) do
+			if not vf.CurrentCamera then
+				local cam = Instance.new("Camera")
+				cam.Parent = vf
+				vf.CurrentCamera = cam
+				initOrbit(vf)
+			end
+		end
+	end)
+	if updateViewportUI then updateViewportUI() end
+end
+
+local function onCopyCamera()
+	local vfs = resolveViewportTargets()
+	local ref = vfs[#vfs]
+	if ref and ref.CurrentCamera then
+		viewportClip = { cframe = ref.CurrentCamera.CFrame, fov = ref.CurrentCamera.FieldOfView, orbit = getOrbit(ref) }
+	end
+	if updateViewportUI then updateViewportUI() end
+end
+
+local function onPasteCamera()
+	if not viewportClip then
+		warn("[ExplorerFunctions] Copy a viewport camera first.")
+		return
+	end
+	local vfs = resolveViewportTargets()
+	recorded("Paste viewport camera", function()
+		for _, vf in ipairs(vfs) do
+			if vf.CurrentCamera then
+				vf.CurrentCamera.CFrame = viewportClip.cframe
+				vf.CurrentCamera.FieldOfView = viewportClip.fov
+				writeOrbit(vf, viewportClip.orbit)
+			end
+		end
+	end)
+	if updateViewportUI then updateViewportUI() end
+end
+
+local function onResetCamera()
+	local vfs = resolveViewportTargets()
+	recorded("Reset viewport camera", function()
+		for _, vf in ipairs(vfs) do
+			if vf.CurrentCamera then initOrbit(vf) end
+		end
+	end)
+	if updateViewportUI then updateViewportUI() end
+end
+
+-- Slider deltas: applied to every target so unique per-frame offsets are kept.
+local function applyOrbitDelta(field, delta)
+	for _, vf in ipairs(resolveViewportTargets()) do
+		if vf.CurrentCamera then
+			local o = getOrbit(vf)
+			o[field] = o[field] + delta
+			applyOrbit(vf, o)
+		end
+	end
+end
+
+local function applyPivotDelta(axis, delta)
+	for _, vf in ipairs(resolveViewportTargets()) do
+		if vf.CurrentCamera then
+			local o = getOrbit(vf)
+			local p = o.pivot
+			if axis == "x" then
+				o.pivot = p + Vector3.new(delta, 0, 0)
+			elseif axis == "y" then
+				o.pivot = p + Vector3.new(0, delta, 0)
+			else
+				o.pivot = p + Vector3.new(0, 0, delta)
+			end
+			applyOrbit(vf, o)
+		end
+	end
+end
+
+-- Undo batching: one recording per slider drag; standalone changes (typed into
+-- the value box) get their own one-shot recording.
+local viewportRec = nil
+local function onSlideDragStart()
+	viewportRec = nil
+	pcall(function() viewportRec = ChangeHistoryService:TryBeginRecording("Viewport camera") end)
+end
+local function onSlideDragEnd()
+	if viewportRec then
+		pcall(function() ChangeHistoryService:FinishRecording(viewportRec, Enum.FinishRecordingOperation.Commit) end)
+		viewportRec = nil
+	end
+end
+local function slideApply(fn, new, old)
+	local delta = new - old
+	if delta == 0 then return end
+	if viewportRec then
+		fn(delta)
+	else
+		recorded("Viewport camera", function() fn(delta) end)
+	end
+end
+
+--------------------------------------------------------------
+-- Hover-hide (same behavior as the D-Pad, for the sliders)
+--------------------------------------------------------------
+
+local function beginViewportHover()
+	if not nudgePageActive() then return end
+	local vfs = selectedViewports()
+	if #vfs > 0 then
+		viewportTarget = vfs
+		viewportRestore = vfs
+		pcall(function() Selection:Set({}) end)
+	end
+end
+
+endViewportHover = function()
+	if #viewportRestore > 0 then
+		local kept = {}
+		for _, vf in ipairs(viewportRestore) do
+			if vf.Parent and vf:IsDescendantOf(game) then table.insert(kept, vf) end
+		end
+		viewportRestore = {}
+		if #kept > 0 then pcall(function() Selection:Set(kept) end) end
+	end
+end
+
+--============================================================
 -- Tools registry
 --   Each tab is a tool. buildTopbar() returns { row1, row2 } of button specs;
 --   renderPage(parent) draws the tool's page. Add tools here in the future.
 --============================================================
 
 local TOOL_DEFS = {}
-local DEFAULT_ORDER = { "ui_editor" }
+local DEFAULT_ORDER = { "ui_editor", "viewport_editor" }
 
 TOOL_DEFS.ui_editor = {
 	id = "ui_editor",
@@ -1747,6 +2199,166 @@ TOOL_DEFS.ui_editor = {
 	end,
 }
 
+TOOL_DEFS.viewport_editor = {
+	id = "viewport_editor",
+	name = "Viewport Editor",
+	buildTopbar = function()
+		return { {}, {} } -- this tool's controls live on the page, not the top bar
+	end,
+	renderPage = function(parent)
+		local holder = Instance.new("Frame")
+		holder.BackgroundTransparency = 1
+		holder.Size = UDim2.new(1, 0, 1, 0)
+		holder.Parent = parent
+		do
+			local layout = Instance.new("UIListLayout")
+			layout.FillDirection = Enum.FillDirection.Vertical
+			layout.SortOrder = Enum.SortOrder.LayoutOrder
+			layout.Padding = UDim.new(0, 6)
+			layout.Parent = holder
+			local pad = Instance.new("UIPadding")
+			pad.PaddingTop = UDim.new(0, 12)
+			pad.PaddingLeft = UDim.new(0, 12)
+			pad.PaddingRight = UDim.new(0, 12)
+			pad.Parent = holder
+		end
+
+		local status = Instance.new("TextLabel")
+		status.BackgroundTransparency = 1
+		status.Size = UDim2.new(1, 0, 0, 18)
+		status.Font = Enum.Font.Gotham
+		status.TextSize = 12
+		status.TextColor3 = THEME.textDim
+		status.TextXAlignment = Enum.TextXAlignment.Left
+		status.TextTruncate = Enum.TextTruncate.AtEnd
+		status.Text = ""
+		status.LayoutOrder = 1
+		status.Parent = holder
+
+		-- Add Camera (shown only when the reference viewport has no camera)
+		local addCam = createBtnVisual(holder, "Add Camera")
+		addCam.AutomaticSize = Enum.AutomaticSize.None
+		addCam.Size = UDim2.new(0, 110, 0, 24)
+		addCam.LayoutOrder = 2
+		addCam.MouseEnter:Connect(function() addCam.BackgroundColor3 = THEME.btnHover end)
+		addCam.MouseLeave:Connect(function() addCam.BackgroundColor3 = THEME.btn end)
+		addCam.MouseButton1Click:Connect(function()
+			local ok, err = pcall(onAddCamera)
+			if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
+		end)
+
+		-- Function buttons: Copy / Paste / Reset Camera
+		local btnRow = Instance.new("Frame")
+		btnRow.BackgroundTransparency = 1
+		btnRow.AutomaticSize = Enum.AutomaticSize.Y
+		btnRow.Size = UDim2.new(1, 0, 0, 24)
+		btnRow.LayoutOrder = 3
+		btnRow.Parent = holder
+		do
+			local l = Instance.new("UIListLayout")
+			l.FillDirection = Enum.FillDirection.Horizontal
+			l.SortOrder = Enum.SortOrder.LayoutOrder
+			l.Padding = UDim.new(0, 4)
+			l.Parent = btnRow
+		end
+		local function fnBtn(text, order, cb)
+			local b = createBtnVisual(btnRow, text)
+			b.AutomaticSize = Enum.AutomaticSize.X
+			b.Size = UDim2.new(0, 0, 0, 24)
+			b.LayoutOrder = order
+			b.MouseEnter:Connect(function() b.BackgroundColor3 = THEME.btnHover end)
+			b.MouseLeave:Connect(function() b.BackgroundColor3 = THEME.btn end)
+			b.MouseButton1Click:Connect(function()
+				local ok, err = pcall(cb)
+				if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
+			end)
+		end
+		fnBtn("Copy", 1, onCopyCamera)
+		fnBtn("Paste", 2, onPasteCamera)
+		fnBtn("Reset Camera", 3, onResetCamera)
+
+		-- Sliders
+		local sliderHolder = Instance.new("Frame")
+		sliderHolder.BackgroundTransparency = 1
+		sliderHolder.AutomaticSize = Enum.AutomaticSize.Y
+		sliderHolder.Size = UDim2.new(1, 0, 0, 0)
+		sliderHolder.LayoutOrder = 4
+		sliderHolder.Parent = holder
+		do
+			local l = Instance.new("UIListLayout")
+			l.FillDirection = Enum.FillDirection.Vertical
+			l.SortOrder = Enum.SortOrder.LayoutOrder
+			l.Padding = UDim.new(0, 4)
+			l.Parent = sliderHolder
+		end
+
+		local function orbitCfg(labelText, field, mn, mx, dec)
+			return {
+				label = labelText, min = mn, max = mx, decimals = dec, default = 0,
+				onChange = function(new, old) slideApply(function(d) applyOrbitDelta(field, d) end, new, old) end,
+				onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
+				onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
+			}
+		end
+		local function pivotCfg(labelText, axis)
+			return {
+				label = labelText, min = -50, max = 50, decimals = 1, default = 0,
+				onChange = function(new, old) slideApply(function(d) applyPivotDelta(axis, d) end, new, old) end,
+				onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
+				onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
+			}
+		end
+
+		local sRoll = makeSlider(sliderHolder, 1, orbitCfg("Roll", "roll", -180, 180, 0))
+		local sPitch = makeSlider(sliderHolder, 2, orbitCfg("Pitch", "pitch", -90, 90, 0))
+		local sYaw = makeSlider(sliderHolder, 3, orbitCfg("Yaw", "yaw", -180, 180, 0))
+		local sZoom = makeSlider(sliderHolder, 4, {
+			label = "Zoom", min = 0.5, max = 50, decimals = 1, default = 8,
+			onChange = function(new, old) slideApply(function(d) applyOrbitDelta("distance", d) end, new, old) end,
+			onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
+			onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
+		})
+		local sX = makeSlider(sliderHolder, 5, pivotCfg("Pos X", "x"))
+		local sY = makeSlider(sliderHolder, 6, pivotCfg("Pos Y", "y"))
+		local sZ = makeSlider(sliderHolder, 7, pivotCfg("Pos Z", "z"))
+
+		updateViewportUI = function()
+			local vfs = resolveViewportTargets()
+			local ref = vfs[#vfs]
+			if not ref then
+				status.Text = "Select a ViewportFrame to edit."
+				addCam.Visible = false
+				btnRow.Visible = false
+				sliderHolder.Visible = false
+				return
+			end
+			local hasCam = ref.CurrentCamera ~= nil
+			status.Text = (#vfs == 1) and ("Editing: " .. safeName(ref))
+				or ("Editing: " .. #vfs .. " ViewportFrames")
+			addCam.Visible = not hasCam
+			btnRow.Visible = hasCam
+			sliderHolder.Visible = hasCam
+			if hasCam then
+				local o = getOrbit(ref)
+				-- rotation sliders are bounded (absolute); distance/position are
+				-- unbounded, so recenter their span around the current value.
+				sRoll.setValue(o.roll)
+				sPitch.setValue(o.pitch)
+				sYaw.setValue(o.yaw)
+				sZoom.setRange(math.max(0.1, o.distance - 20), o.distance + 20)
+				sZoom.setValue(o.distance)
+				sX.setRange(o.pivot.X - 25, o.pivot.X + 25)
+				sX.setValue(o.pivot.X)
+				sY.setRange(o.pivot.Y - 25, o.pivot.Y + 25)
+				sY.setValue(o.pivot.Y)
+				sZ.setRange(o.pivot.Z - 25, o.pivot.Z + 25)
+				sZ.setValue(o.pivot.Z)
+			end
+		end
+		updateViewportUI()
+	end,
+}
+
 local function activeTool()
 	return TOOL_DEFS[toolOrder[activeIndex]]
 end
@@ -1842,9 +2454,14 @@ refreshTabs = function()
 end
 
 refreshPage = function()
-	-- Rebuilding destroys the D-Pad, so restore any hover-hidden selection first
-	-- (its MouseLeave would otherwise never fire).
+	-- Rebuilding destroys the page's controls, so restore any hover-hidden
+	-- selection first (their MouseLeave would otherwise never fire).
 	if endNudgeHover then endNudgeHover() end
+	if endViewportHover then endViewportHover() end
+	-- Drop page-scoped refs so a switched-away tool's updaters no-op and the two
+	-- pages never mix.
+	nudgeStatusLabel, nudgeModeHolder, nudgeInvertBtn = nil, nil, nil
+	updateViewportUI = nil
 	clearChildren(pageArea)
 	local tool = activeTool()
 	if tool and tool.renderPage then
@@ -1874,8 +2491,10 @@ widget:GetPropertyChangedSignal("Enabled"):Connect(function()
 	toggleButton:SetActive(widget.Enabled)
 	if widget.Enabled then
 		refreshAll()
-	elseif endNudgeHover then
-		endNudgeHover() -- panel closed: don't leave a hover-hidden selection stuck
+	else
+		-- panel closed: don't leave a hover-hidden selection stuck
+		if endNudgeHover then endNudgeHover() end
+		if endViewportHover then endViewportHover() end
 	end
 end)
 
@@ -1887,6 +2506,7 @@ Selection.SelectionChanged:Connect(function()
 	if loOverlay.Visible then showLayoutOrderMenu() end
 	if updateNudgeStatus then updateNudgeStatus() end
 	if updateNudgePageMode then updateNudgePageMode() end
+	if updateViewportUI then updateViewportUI() end
 end)
 
 --============================================================
