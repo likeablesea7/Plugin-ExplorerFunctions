@@ -6,6 +6,7 @@ local Selection = game:GetService("Selection")
 local HttpService = game:GetService("HttpService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 
 --============================================================
 -- Config / Theme
@@ -612,18 +613,6 @@ local function makeTab(parent, name, index, isActive)
 	return b
 end
 
-local function makeArrow(parent, text, layoutOrder, cb)
-	local b = createBtnVisual(parent, text)
-	b.LayoutOrder = layoutOrder
-	b.TextColor3 = THEME.text
-	b.MouseEnter:Connect(function() b.BackgroundColor3 = THEME.btnHover end)
-	b.MouseLeave:Connect(function() b.BackgroundColor3 = THEME.btn end)
-	b.MouseButton1Click:Connect(function()
-		local ok, err = pcall(cb)
-		if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
-	end)
-	return b
-end
 
 local function clearChildren(guiObj)
 	for _, child in ipairs(guiObj:GetChildren()) do
@@ -759,35 +748,44 @@ local function makeSlider(parent, order, cfg)
 		return cfg.min + rel * (cfg.max - cfg.min)
 	end
 
-	local dragging, hovering, moveConn, endConn = false, false, nil, nil
+	local dragging, hovering, startValue, dragConn = false, false, nil, nil
 	local function hoverStart() if cfg.onHoverStart then cfg.onHoverStart() end end
 	local function hoverEnd() if cfg.onHoverEnd then cfg.onHoverEnd() end end
-	local function stopDrag()
+
+	-- Plugin-widget input note: UserInputService does not report mouse movement
+	-- over a DockWidget's GUI (only over the 3D viewport), and its coordinates are
+	-- in a different space. So a drag is driven by polling the widget's own mouse
+	-- position + button state each Heartbeat, which is reliable everywhere.
+	local function stopDrag(cancel)
+		if not dragging then return end
 		dragging = false
-		if moveConn then moveConn:Disconnect(); moveConn = nil end
-		if endConn then endConn:Disconnect(); endConn = nil end
-		if cfg.onDragEnd then cfg.onDragEnd() end
-		-- cursor may have left the row during the drag; restore only if it did
-		if not hovering then hoverEnd() end
+		if dragConn then dragConn:Disconnect(); dragConn = nil end
+		if cancel and startValue ~= nil then
+			apply(startValue) -- RMB cancel: return to the pre-drag value
+		end
+		if cfg.onDragEnd then cfg.onDragEnd(cancel == true) end
+		if not hovering then hoverEnd() end -- cursor may have left the row mid-drag
 	end
-	hit.InputBegan:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+	hit.MouseButton1Down:Connect(function()
+		if dragging then return end
 		dragging = true
-		hoverStart() -- ensure the selection stays hidden through the drag
+		startValue = value
+		hoverStart() -- keep the selection hidden through the drag
 		if cfg.onDragStart then cfg.onDragStart() end
-		apply(valueFromX(input.Position.X))
-		moveConn = UserInputService.InputChanged:Connect(function(inp)
-			if dragging and inp.UserInputType == Enum.UserInputType.MouseMovement then
-				apply(valueFromX(inp.Position.X))
+		apply(valueFromX(widget:GetRelativeMousePosition().X))
+		dragConn = RunService.Heartbeat:Connect(function()
+			if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+				stopDrag(false) -- released anywhere
+			elseif UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+				stopDrag(true) -- RMB cancels the drag
+			else
+				apply(valueFromX(widget:GetRelativeMousePosition().X))
 			end
-		end)
-		endConn = UserInputService.InputEnded:Connect(function(inp)
-			if inp.UserInputType == Enum.UserInputType.MouseButton1 then stopDrag() end
 		end)
 	end)
 	-- clean up if the slider is destroyed mid-drag (e.g. tab switch)
 	row.Destroying:Connect(function()
-		if dragging then stopDrag() end
+		if dragging then stopDrag(false) end
 	end)
 
 	-- Hover over the whole row hides the Studio selection box (like the D-Pad).
@@ -1995,16 +1993,41 @@ local function applyPivotDelta(axis, delta)
 	end
 end
 
+-- FOV: change FieldOfView but compensate distance so the subject keeps the same
+-- apparent size (a smaller FOV would otherwise appear to zoom in). This lets FOV
+-- control perspective independently of the Zoom (distance) slider.
+local function applyFOVDelta(delta)
+	for _, vf in ipairs(resolveViewportTargets()) do
+		local cam = vf.CurrentCamera
+		if cam then
+			local oldFOV = cam.FieldOfView
+			local newFOV = math.clamp(oldFOV + delta, 1, 120)
+			if newFOV ~= oldFOV then
+				local o = getOrbit(vf)
+				o.distance = math.max(0.05, o.distance
+					* (math.tan(math.rad(oldFOV * 0.5)) / math.tan(math.rad(newFOV * 0.5))))
+				cam.FieldOfView = newFOV
+				applyOrbit(vf, o)
+			end
+		end
+	end
+end
+
 -- Undo batching: one recording per slider drag; standalone changes (typed into
--- the value box) get their own one-shot recording.
+-- the value box) get their own one-shot recording. veSliderDragging gates the
+-- page refresh so the hover-deselect during a drag can't reset the sliders.
 local viewportRec = nil
+local veSliderDragging = false
 local function onSlideDragStart()
+	veSliderDragging = true
 	viewportRec = nil
 	pcall(function() viewportRec = ChangeHistoryService:TryBeginRecording("Viewport camera") end)
 end
-local function onSlideDragEnd()
+local function onSlideDragEnd(cancel)
+	veSliderDragging = false
 	if viewportRec then
-		pcall(function() ChangeHistoryService:FinishRecording(viewportRec, Enum.FinishRecordingOperation.Commit) end)
+		local op = cancel and Enum.FinishRecordingOperation.Cancel or Enum.FinishRecordingOperation.Commit
+		pcall(function() ChangeHistoryService:FinishRecording(viewportRec, op) end)
 		viewportRec = nil
 	end
 end
@@ -2318,11 +2341,18 @@ TOOL_DEFS.viewport_editor = {
 			onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
 			onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
 		})
-		local sX = makeSlider(sliderHolder, 5, pivotCfg("Pos X", "x"))
-		local sY = makeSlider(sliderHolder, 6, pivotCfg("Pos Y", "y"))
-		local sZ = makeSlider(sliderHolder, 7, pivotCfg("Pos Z", "z"))
+		local sFOV = makeSlider(sliderHolder, 5, {
+			label = "FOV", min = 1, max = 120, decimals = 0, default = FOV_DEFAULT,
+			onChange = function(new, old) slideApply(applyFOVDelta, new, old) end,
+			onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
+			onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
+		})
+		local sX = makeSlider(sliderHolder, 6, pivotCfg("Pos X", "x"))
+		local sY = makeSlider(sliderHolder, 7, pivotCfg("Pos Y", "y"))
+		local sZ = makeSlider(sliderHolder, 8, pivotCfg("Pos Z", "z"))
 
 		updateViewportUI = function()
+			if veSliderDragging then return end -- don't fight an active slider drag
 			local vfs = resolveViewportTargets()
 			local ref = vfs[#vfs]
 			if not ref then
@@ -2347,6 +2377,7 @@ TOOL_DEFS.viewport_editor = {
 				sYaw.setValue(o.yaw)
 				sZoom.setRange(math.max(0.1, o.distance - 20), o.distance + 20)
 				sZoom.setValue(o.distance)
+				sFOV.setValue(ref.CurrentCamera.FieldOfView)
 				sX.setRange(o.pivot.X - 25, o.pivot.X + 25)
 				sX.setValue(o.pivot.X)
 				sY.setRange(o.pivot.Y - 25, o.pivot.Y + 25)
@@ -2431,25 +2462,7 @@ end
 refreshTabs = function()
 	clearChildren(tabRow)
 	for i, id in ipairs(toolOrder) do
-		local def = TOOL_DEFS[id]
-		local isActive = (i == activeIndex)
-		if isActive and i > 1 then
-			makeArrow(tabRow, "<", i * 10 - 1, function()
-				toolOrder[i], toolOrder[i - 1] = toolOrder[i - 1], toolOrder[i]
-				activeIndex = i - 1
-				save()
-				refreshAll()
-			end)
-		end
-		makeTab(tabRow, def.name, i, isActive)
-		if isActive and i < #toolOrder then
-			makeArrow(tabRow, ">", i * 10 + 1, function()
-				toolOrder[i], toolOrder[i + 1] = toolOrder[i + 1], toolOrder[i]
-				activeIndex = i + 1
-				save()
-				refreshAll()
-			end)
-		end
+		makeTab(tabRow, TOOL_DEFS[id].name, i, i == activeIndex)
 	end
 end
 
