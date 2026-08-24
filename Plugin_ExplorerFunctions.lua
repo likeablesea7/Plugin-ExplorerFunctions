@@ -1863,10 +1863,29 @@ local CAM_PROPS = {
 	"CFrame", "FieldOfView", "FieldOfViewMode", "Focus", "HeadLocked", "HeadScale",
 }
 
+-- Resolve the selection to ViewportFrames: a selected ViewportFrame counts
+-- directly, and a selected descendant (its Camera, a Part inside it, ...) resolves
+-- to the ViewportFrame that contains it. Deduplicated, order preserved.
 local function selectedViewports()
-	local out = {}
+	local seen, out = {}, {}
 	for _, inst in ipairs(currentSelection()) do
-		if isA(inst, "ViewportFrame") then table.insert(out, inst) end
+		local vf = nil
+		if isA(inst, "ViewportFrame") then
+			vf = inst
+		else
+			local a = safeParent(inst)
+			while a and a ~= game do
+				if isA(a, "ViewportFrame") then
+					vf = a
+					break
+				end
+				a = safeParent(a)
+			end
+		end
+		if vf and not seen[vf] then
+			seen[vf] = true
+			table.insert(out, vf)
+		end
 	end
 	return out
 end
@@ -2158,6 +2177,9 @@ local function onSlideDragEnd(cancel)
 		pcall(function() ChangeHistoryService:FinishRecording(viewportRec, op) end)
 		viewportRec = nil
 	end
+	-- Refresh immediately on release (recenters the unbounded sliders) regardless
+	-- of selection state, instead of waiting for the reselect's SelectionChanged.
+	if updateViewportUI then updateViewportUI() end
 end
 local function slideApply(fn, new, old)
 	local delta = new - old
@@ -2178,7 +2200,7 @@ local function beginViewportHover()
 	local vfs = selectedViewports()
 	if #vfs > 0 then
 		viewportTarget = vfs
-		viewportRestore = vfs
+		viewportRestore = currentSelection() -- restore the user's actual selection (VF or a child)
 		pcall(function() Selection:Set({}) end)
 	end
 end
@@ -2556,11 +2578,11 @@ TOOL_DEFS.viewport_editor = {
 				sZoom.setRange(math.max(0.1, o.distance - 20), o.distance + 20)
 				sZoom.setValue(o.distance)
 				sFOV.setValue(ref.CurrentCamera.FieldOfView)
-				sX.setRange(o.pivot.X - 25, o.pivot.X + 25)
+				sX.setRange(o.pivot.X - 10, o.pivot.X + 10)
 				sX.setValue(o.pivot.X)
-				sY.setRange(o.pivot.Y - 25, o.pivot.Y + 25)
+				sY.setRange(o.pivot.Y - 10, o.pivot.Y + 10)
 				sY.setValue(o.pivot.Y)
-				sZ.setRange(o.pivot.Z - 25, o.pivot.Z + 25)
+				sZ.setRange(o.pivot.Z - 10, o.pivot.Z + 10)
 				sZ.setValue(o.pivot.Z)
 				local ld = ref.LightDirection
 				sLX.setRange(ld.X - 2, ld.X + 2)
