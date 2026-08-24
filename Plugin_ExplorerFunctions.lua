@@ -224,7 +224,8 @@ local endNudgeHover           -- forward-declared; restores a hover-hidden selec
 -- Viewport Editor state.
 local viewportTarget = {}     -- armed ViewportFrames (kept while deselected during hover)
 local viewportRestore = {}    -- ViewportFrames to re-select on hover-out
-local viewportClip = nil      -- copied camera { cframe, fov }
+local viewportClip = nil      -- copied camera { props = {name=value}, orbit = {...} }
+local viewportLightClip = nil -- copied lighting { LightDirection = Vector3 }
 local updateViewportUI        -- forward-declared; rebuilds the Viewport page for the selection
 local endViewportHover        -- forward-declared; restores a hover-hidden selection
 
@@ -823,11 +824,17 @@ local function makeSlider(parent, order, cfg)
 		hoverStart() -- keep the selection hidden through the drag
 		if cfg.onDragStart then cfg.onDragStart() end
 		apply(valueFromX(relMouseX()))
-		-- The catcher captures the release; poll position each Heartbeat for movement.
 		beginSharedDrag(stopDrag)
 		dragConn = RunService.Heartbeat:Connect(function()
 			if dragging then apply(valueFromX(relMouseX())) end
 		end)
+	end)
+	-- The mouse input is captured by the object it began on, so the drag's own
+	-- release fires hit.InputEnded (not the catcher — that only sees a fresh click).
+	hit.InputEnded:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseButton1 then
+			endSharedDrag(false)
+		end
 	end)
 	-- clean up if the slider is destroyed mid-drag (e.g. tab switch)
 	row.Destroying:Connect(function()
@@ -1848,6 +1855,13 @@ end
 --============================================================
 
 local FOV_DEFAULT = 70
+local LIGHT_DEFAULT = Vector3.new(-1, -1, -1.5)
+
+-- Camera properties the Copy/Paste buttons carry ("all properties" of the camera
+-- that matter for a viewport). Whichever a given camera exposes are copied.
+local CAM_PROPS = {
+	"CFrame", "FieldOfView", "FieldOfViewMode", "Focus", "HeadLocked", "HeadScale",
+}
 
 local function selectedViewports()
 	local out = {}
@@ -1978,7 +1992,12 @@ local function onCopyCamera()
 	local vfs = resolveViewportTargets()
 	local ref = vfs[#vfs]
 	if ref and ref.CurrentCamera then
-		viewportClip = { cframe = ref.CurrentCamera.CFrame, fov = ref.CurrentCamera.FieldOfView, orbit = getOrbit(ref) }
+		local props = {}
+		for _, name in ipairs(CAM_PROPS) do
+			local ok, v = pcall(function() return ref.CurrentCamera[name] end)
+			if ok then props[name] = v end
+		end
+		viewportClip = { props = props, orbit = getOrbit(ref) }
 	end
 	if updateViewportUI then updateViewportUI() end
 end
@@ -1992,13 +2011,24 @@ local function onPasteCamera()
 	recorded("Paste viewport camera", function()
 		for _, vf in ipairs(vfs) do
 			if vf.CurrentCamera then
-				vf.CurrentCamera.CFrame = viewportClip.cframe
-				vf.CurrentCamera.FieldOfView = viewportClip.fov
+				for _, name in ipairs(CAM_PROPS) do
+					if viewportClip.props[name] ~= nil then
+						pcall(function() vf.CurrentCamera[name] = viewportClip.props[name] end)
+					end
+				end
 				writeOrbit(vf, viewportClip.orbit)
 			end
 		end
 	end)
 	if updateViewportUI then updateViewportUI() end
+end
+
+-- Count of camera properties on the clipboard (for the "Paste (N)" label).
+local function cameraClipCount()
+	if not viewportClip then return 0 end
+	local n = 0
+	for _ in pairs(viewportClip.props) do n += 1 end
+	return n
 end
 
 local function onResetCamera()
@@ -2009,6 +2039,44 @@ local function onResetCamera()
 		end
 	end)
 	if updateViewportUI then updateViewportUI() end
+end
+
+-- Lighting: Copy / Paste / Reset the ViewportFrame's LightDirection.
+local function onCopyLighting()
+	local vfs = resolveViewportTargets()
+	local ref = vfs[#vfs]
+	if ref then
+		viewportLightClip = { LightDirection = ref.LightDirection }
+	end
+	if updateViewportUI then updateViewportUI() end
+end
+
+local function onPasteLighting()
+	if not viewportLightClip then
+		warn("[ExplorerFunctions] Copy a viewport's lighting first.")
+		return
+	end
+	local vfs = resolveViewportTargets()
+	recorded("Paste viewport lighting", function()
+		for _, vf in ipairs(vfs) do
+			pcall(function() vf.LightDirection = viewportLightClip.LightDirection end)
+		end
+	end)
+	if updateViewportUI then updateViewportUI() end
+end
+
+local function onResetLighting()
+	local vfs = resolveViewportTargets()
+	recorded("Reset viewport lighting", function()
+		for _, vf in ipairs(vfs) do
+			pcall(function() vf.LightDirection = LIGHT_DEFAULT end)
+		end
+	end)
+	if updateViewportUI then updateViewportUI() end
+end
+
+local function lightingClipCount()
+	return viewportLightClip and 1 or 0
 end
 
 -- Slider deltas: applied to every target so unique per-frame offsets are kept.
@@ -2035,6 +2103,20 @@ local function applyPivotDelta(axis, delta)
 				o.pivot = p + Vector3.new(0, 0, delta)
 			end
 			applyOrbit(vf, o)
+		end
+	end
+end
+
+-- Lighting direction slider deltas (applied to every target as an offset).
+local function applyLightDelta(axis, delta)
+	for _, vf in ipairs(resolveViewportTargets()) do
+		local d = vf.LightDirection
+		if axis == "x" then
+			vf.LightDirection = d + Vector3.new(delta, 0, 0)
+		elseif axis == "y" then
+			vf.LightDirection = d + Vector3.new(0, delta, 0)
+		else
+			vf.LightDirection = d + Vector3.new(0, 0, delta)
 		end
 	end
 end
@@ -2330,8 +2412,8 @@ TOOL_DEFS.viewport_editor = {
 			l.Padding = UDim.new(0, 4)
 			l.Parent = btnRow
 		end
-		local function fnBtn(text, order, cb)
-			local b = createBtnVisual(btnRow, text)
+		local function fnBtn(parentRow, text, order, cb)
+			local b = createBtnVisual(parentRow, text)
 			b.AutomaticSize = Enum.AutomaticSize.X
 			b.Size = UDim2.new(0, 0, 0, 24)
 			b.LayoutOrder = order
@@ -2341,12 +2423,19 @@ TOOL_DEFS.viewport_editor = {
 				local ok, err = pcall(cb)
 				if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
 			end)
+			return b
 		end
-		fnBtn("Copy", 1, onCopyCamera)
-		fnBtn("Paste", 2, onPasteCamera)
-		fnBtn("Reset Camera", 3, onResetCamera)
+		fnBtn(btnRow, "Copy", 1, onCopyCamera)
+		local pasteCamBtn = fnBtn(btnRow, "Paste", 2, onPasteCamera)
+		fnBtn(btnRow, "Reset Camera", 3, onResetCamera)
 
-		-- Sliders
+		local commonCfg = function(t)
+			t.onDragStart, t.onDragEnd = onSlideDragStart, onSlideDragEnd
+			t.onHoverStart, t.onHoverEnd = beginViewportHover, endViewportHover
+			return t
+		end
+
+		-- Camera sliders
 		local sliderHolder = Instance.new("Frame")
 		sliderHolder.BackgroundTransparency = 1
 		sliderHolder.AutomaticSize = Enum.AutomaticSize.Y
@@ -2362,43 +2451,82 @@ TOOL_DEFS.viewport_editor = {
 		end
 
 		local function orbitCfg(labelText, field, mn, mx, dec)
-			return {
+			return commonCfg({
 				label = labelText, min = mn, max = mx, decimals = dec, default = 0,
 				onChange = function(new, old) slideApply(function(d) applyOrbitDelta(field, d) end, new, old) end,
-				onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
-				onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
-			}
+			})
 		end
 		local function pivotCfg(labelText, axis)
-			return {
+			return commonCfg({
 				label = labelText, min = -50, max = 50, decimals = 1, default = 0,
 				onChange = function(new, old) slideApply(function(d) applyPivotDelta(axis, d) end, new, old) end,
-				onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
-				onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
-			}
+			})
 		end
 
 		local sRoll = makeSlider(sliderHolder, 1, orbitCfg("Roll", "roll", -180, 180, 0))
 		local sPitch = makeSlider(sliderHolder, 2, orbitCfg("Pitch", "pitch", -90, 90, 0))
 		local sYaw = makeSlider(sliderHolder, 3, orbitCfg("Yaw", "yaw", -180, 180, 0))
-		local sZoom = makeSlider(sliderHolder, 4, {
+		local sZoom = makeSlider(sliderHolder, 4, commonCfg({
 			label = "Zoom", min = 0.5, max = 50, decimals = 1, default = 8,
 			onChange = function(new, old) slideApply(function(d) applyOrbitDelta("distance", d) end, new, old) end,
-			onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
-			onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
-		})
-		local sFOV = makeSlider(sliderHolder, 5, {
+		}))
+		local sFOV = makeSlider(sliderHolder, 5, commonCfg({
 			label = "FOV", min = 1, max = 120, decimals = 0, default = FOV_DEFAULT,
 			onChange = function(new, old) slideApply(applyFOVDelta, new, old) end,
-			onDragStart = onSlideDragStart, onDragEnd = onSlideDragEnd,
-			onHoverStart = beginViewportHover, onHoverEnd = endViewportHover,
-		})
+		}))
 		local sX = makeSlider(sliderHolder, 6, pivotCfg("Pos X", "x"))
 		local sY = makeSlider(sliderHolder, 7, pivotCfg("Pos Y", "y"))
 		local sZ = makeSlider(sliderHolder, 8, pivotCfg("Pos Z", "z"))
 
+		-- Lighting: Copy / Paste / Reset + direction sliders
+		local lightBtnRow = Instance.new("Frame")
+		lightBtnRow.BackgroundTransparency = 1
+		lightBtnRow.AutomaticSize = Enum.AutomaticSize.Y
+		lightBtnRow.Size = UDim2.new(1, 0, 0, 24)
+		lightBtnRow.LayoutOrder = 5
+		lightBtnRow.Parent = holder
+		do
+			local l = Instance.new("UIListLayout")
+			l.FillDirection = Enum.FillDirection.Horizontal
+			l.SortOrder = Enum.SortOrder.LayoutOrder
+			l.Padding = UDim.new(0, 4)
+			l.Parent = lightBtnRow
+		end
+		fnBtn(lightBtnRow, "Copy", 1, onCopyLighting)
+		local pasteLightBtn = fnBtn(lightBtnRow, "Paste", 2, onPasteLighting)
+		fnBtn(lightBtnRow, "Reset Lighting", 3, onResetLighting)
+
+		local lightSliders = Instance.new("Frame")
+		lightSliders.BackgroundTransparency = 1
+		lightSliders.AutomaticSize = Enum.AutomaticSize.Y
+		lightSliders.Size = UDim2.new(1, 0, 0, 0)
+		lightSliders.LayoutOrder = 6
+		lightSliders.Parent = holder
+		do
+			local l = Instance.new("UIListLayout")
+			l.FillDirection = Enum.FillDirection.Vertical
+			l.SortOrder = Enum.SortOrder.LayoutOrder
+			l.Padding = UDim.new(0, 4)
+			l.Parent = lightSliders
+		end
+		local function lightCfg(labelText, axis)
+			return commonCfg({
+				label = labelText, min = -2, max = 2, decimals = 2, default = 0,
+				onChange = function(new, old) slideApply(function(d) applyLightDelta(axis, d) end, new, old) end,
+			})
+		end
+		local sLX = makeSlider(lightSliders, 1, lightCfg("Light X", "x"))
+		local sLY = makeSlider(lightSliders, 2, lightCfg("Light Y", "y"))
+		local sLZ = makeSlider(lightSliders, 3, lightCfg("Light Z", "z"))
+
+		local function pasteLabelFor(n)
+			return n > 0 and ("Paste (" .. n .. ")") or "Paste"
+		end
+
 		updateViewportUI = function()
 			if veSliderDragging then return end -- don't fight an active slider drag
+			pasteCamBtn.Text = pasteLabelFor(cameraClipCount())
+			pasteLightBtn.Text = pasteLabelFor(lightingClipCount())
 			local vfs = resolveViewportTargets()
 			local ref = vfs[#vfs]
 			if not ref then
@@ -2406,6 +2534,8 @@ TOOL_DEFS.viewport_editor = {
 				addCam.Visible = false
 				btnRow.Visible = false
 				sliderHolder.Visible = false
+				lightBtnRow.Visible = false
+				lightSliders.Visible = false
 				return
 			end
 			local hasCam = ref.CurrentCamera ~= nil
@@ -2414,10 +2544,12 @@ TOOL_DEFS.viewport_editor = {
 			addCam.Visible = not hasCam
 			btnRow.Visible = hasCam
 			sliderHolder.Visible = hasCam
+			lightBtnRow.Visible = hasCam
+			lightSliders.Visible = hasCam
 			if hasCam then
 				local o = getOrbit(ref)
-				-- rotation sliders are bounded (absolute); distance/position are
-				-- unbounded, so recenter their span around the current value.
+				-- rotation sliders are bounded (absolute); distance/position/light
+				-- are unbounded, so recenter their span around the current value.
 				sRoll.setValue(o.roll)
 				sPitch.setValue(o.pitch)
 				sYaw.setValue(o.yaw)
@@ -2430,6 +2562,13 @@ TOOL_DEFS.viewport_editor = {
 				sY.setValue(o.pivot.Y)
 				sZ.setRange(o.pivot.Z - 25, o.pivot.Z + 25)
 				sZ.setValue(o.pivot.Z)
+				local ld = ref.LightDirection
+				sLX.setRange(ld.X - 2, ld.X + 2)
+				sLX.setValue(ld.X)
+				sLY.setRange(ld.Y - 2, ld.Y + 2)
+				sLY.setValue(ld.Y)
+				sLZ.setRange(ld.Z - 2, ld.Z + 2)
+				sLZ.setValue(ld.Z)
 			end
 		end
 		updateViewportUI()
