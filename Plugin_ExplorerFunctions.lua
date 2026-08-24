@@ -620,14 +620,64 @@ local function clearChildren(guiObj)
 	end
 end
 
+-- Shared drag catcher. Plugin widgets do NOT deliver mouse movement through
+-- UserInputService, and IsMouseButtonPressed is unreliable here; but a widget's
+-- own GuiObject input events DO fire, and PluginGui:GetRelativeMousePosition()
+-- tracks the cursor once a drag began on the widget. So during a slider drag we
+-- show a transparent, Active, full-window frame on top to capture the release
+-- (mouse-up) anywhere over the window, and poll GetRelativeMousePosition for
+-- movement. UserInputService.InputEnded is a fallback for release over the 3D view.
+local dragCatcher = Instance.new("Frame")
+dragCatcher.Name = "DragCatcher"
+dragCatcher.BackgroundTransparency = 1
+dragCatcher.Active = true
+dragCatcher.Size = UDim2.new(1, 0, 1, 0)
+dragCatcher.ZIndex = 100
+dragCatcher.Visible = false
+dragCatcher.Parent = content
+
+local activeDragStop = nil -- function(cancel) for the slider currently dragging
+local function endSharedDrag(cancel)
+	local stop = activeDragStop
+	if not stop then return end
+	activeDragStop = nil
+	dragCatcher.Visible = false
+	stop(cancel)
+end
+local function beginSharedDrag(stop)
+	activeDragStop = stop
+	dragCatcher.Visible = true
+end
+dragCatcher.InputBegan:Connect(function(input)
+	if activeDragStop and input.UserInputType == Enum.UserInputType.MouseButton2 then
+		endSharedDrag(true) -- right-click cancels immediately
+	end
+end)
+dragCatcher.InputEnded:Connect(function(input)
+	if activeDragStop and input.UserInputType == Enum.UserInputType.MouseButton1 then
+		endSharedDrag(false)
+	end
+end)
+-- Fallbacks for release / right-click while the cursor is over the 3D viewport.
+UserInputService.InputEnded:Connect(function(input)
+	if activeDragStop and input.UserInputType == Enum.UserInputType.MouseButton1 then
+		endSharedDrag(false)
+	end
+end)
+UserInputService.InputBegan:Connect(function(input)
+	if activeDragStop and input.UserInputType == Enum.UserInputType.MouseButton2 then
+		endSharedDrag(true)
+	end
+end)
+
 -- Themed slider: [label] [value TextBox] [track+fill+handle]. Dragging the handle
--- follows the cursor left/right even past the track (via UserInputService) until
--- the mouse button is released. The value TextBox is transparent and selects all
--- on focus for quick manual entry.
+-- follows the cursor left/right even past the track until the mouse is released;
+-- right-click while dragging cancels and restores the pre-drag value. The value
+-- TextBox is transparent and selects all on focus for quick manual entry.
 --
 -- cfg = { label, min, max, default, decimals, onChange(newValue, oldValue),
---         onDragStart(), onDragEnd(), onHoverStart(), onHoverEnd() }
--- Returns a controller: { row, setValue(v) }  (setValue never fires onChange).
+--         onDragStart(), onDragEnd(cancel), onHoverStart(), onHoverEnd() }
+-- Returns a controller: { row, setValue(v), setRange(mn, mx) }.
 local function makeSlider(parent, order, cfg)
 	local decimals = cfg.decimals or 0
 	local function fmt(v)
@@ -752,10 +802,10 @@ local function makeSlider(parent, order, cfg)
 	local function hoverStart() if cfg.onHoverStart then cfg.onHoverStart() end end
 	local function hoverEnd() if cfg.onHoverEnd then cfg.onHoverEnd() end end
 
-	-- Plugin-widget input note: UserInputService does not report mouse movement
-	-- over a DockWidget's GUI (only over the 3D viewport), and its coordinates are
-	-- in a different space. So a drag is driven by polling the widget's own mouse
-	-- position + button state each Heartbeat, which is reliable everywhere.
+	local function relMouseX()
+		local ok, pos = pcall(function() return widget:GetRelativeMousePosition() end)
+		return (ok and pos) and pos.X or track.AbsolutePosition.X
+	end
 	local function stopDrag(cancel)
 		if not dragging then return end
 		dragging = false
@@ -766,26 +816,22 @@ local function makeSlider(parent, order, cfg)
 		if cfg.onDragEnd then cfg.onDragEnd(cancel == true) end
 		if not hovering then hoverEnd() end -- cursor may have left the row mid-drag
 	end
-	hit.MouseButton1Down:Connect(function()
-		if dragging then return end
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 or dragging then return end
 		dragging = true
 		startValue = value
 		hoverStart() -- keep the selection hidden through the drag
 		if cfg.onDragStart then cfg.onDragStart() end
-		apply(valueFromX(widget:GetRelativeMousePosition().X))
+		apply(valueFromX(relMouseX()))
+		-- The catcher captures the release; poll position each Heartbeat for movement.
+		beginSharedDrag(stopDrag)
 		dragConn = RunService.Heartbeat:Connect(function()
-			if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
-				stopDrag(false) -- released anywhere
-			elseif UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-				stopDrag(true) -- RMB cancels the drag
-			else
-				apply(valueFromX(widget:GetRelativeMousePosition().X))
-			end
+			if dragging then apply(valueFromX(relMouseX())) end
 		end)
 	end)
 	-- clean up if the slider is destroyed mid-drag (e.g. tab switch)
 	row.Destroying:Connect(function()
-		if dragging then stopDrag(false) end
+		if dragging then endSharedDrag(false) end
 	end)
 
 	-- Hover over the whole row hides the Studio selection box (like the D-Pad).
