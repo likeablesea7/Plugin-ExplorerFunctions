@@ -1973,6 +1973,7 @@ local function applyOrbit(vf, o)
 		pcall(function() vf.LightDirection = dR * dir end)
 	end
 	writeOrbit(vf, o)
+	vf:SetAttribute("VE_FOV", cam.FieldOfView) -- persist so a rasterized camera can be restored
 end
 
 -- Default preset: front-on, framed so a 2x2x2 box (or the actual contents) fits.
@@ -1984,6 +1985,7 @@ local function initOrbit(vf)
 		vf.CurrentCamera.CFrame = orbitToCFrame(o.pivot, o.distance, o.yaw, o.pitch, o.roll)
 	end
 	writeOrbit(vf, o)
+	vf:SetAttribute("VE_FOV", FOV_DEFAULT)
 	return o
 end
 
@@ -2001,6 +2003,31 @@ local function onAddCamera()
 				cam.Parent = vf
 				vf.CurrentCamera = cam
 				initOrbit(vf)
+			end
+		end
+	end)
+	if updateViewportUI then updateViewportUI() end
+end
+
+-- True if the ViewportFrame carries stored camera data (e.g. after a playtest
+-- rasterized and removed its Camera but left the attributes behind).
+local function hasStoredCamera(vf)
+	return vf:GetAttribute("VE_Distance") ~= nil or vf:GetAttribute("VE_Pivot") ~= nil
+end
+
+-- Re-create the Camera from the stored attributes, restoring its original angle /
+-- distance / pivot / FOV rather than the default preset.
+local function onRestoreCamera()
+	local vfs = resolveViewportTargets()
+	recorded("Restore viewport camera", function()
+		for _, vf in ipairs(vfs) do
+			if not vf.CurrentCamera and hasStoredCamera(vf) then
+				local cam = Instance.new("Camera")
+				cam.Parent = vf
+				vf.CurrentCamera = cam
+				local o = getOrbit(vf)
+				cam.FieldOfView = vf:GetAttribute("VE_FOV") or FOV_DEFAULT
+				cam.CFrame = orbitToCFrame(o.pivot, o.distance, o.yaw, o.pitch, o.roll)
 			end
 		end
 	end)
@@ -2420,12 +2447,25 @@ TOOL_DEFS.viewport_editor = {
 			if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
 		end)
 
+		-- Restore Camera (shown when the reference viewport has no camera but
+		-- stored orbit attributes remain, e.g. after playtest rasterization)
+		local restoreCam = createBtnVisual(holder, "Restore Camera")
+		restoreCam.AutomaticSize = Enum.AutomaticSize.None
+		restoreCam.Size = UDim2.new(0, 110, 0, 24)
+		restoreCam.LayoutOrder = 3
+		restoreCam.MouseEnter:Connect(function() restoreCam.BackgroundColor3 = THEME.btnHover end)
+		restoreCam.MouseLeave:Connect(function() restoreCam.BackgroundColor3 = THEME.btn end)
+		restoreCam.MouseButton1Click:Connect(function()
+			local ok, err = pcall(onRestoreCamera)
+			if not ok then warn("[ExplorerFunctions] " .. tostring(err)) end
+		end)
+
 		-- Function buttons: Copy / Paste / Reset Camera
 		local btnRow = Instance.new("Frame")
 		btnRow.BackgroundTransparency = 1
 		btnRow.AutomaticSize = Enum.AutomaticSize.Y
 		btnRow.Size = UDim2.new(1, 0, 0, 24)
-		btnRow.LayoutOrder = 3
+		btnRow.LayoutOrder = 4
 		btnRow.Parent = holder
 		do
 			local l = Instance.new("UIListLayout")
@@ -2462,7 +2502,7 @@ TOOL_DEFS.viewport_editor = {
 		sliderHolder.BackgroundTransparency = 1
 		sliderHolder.AutomaticSize = Enum.AutomaticSize.Y
 		sliderHolder.Size = UDim2.new(1, 0, 0, 0)
-		sliderHolder.LayoutOrder = 4
+		sliderHolder.LayoutOrder = 5
 		sliderHolder.Parent = holder
 		do
 			local l = Instance.new("UIListLayout")
@@ -2505,7 +2545,7 @@ TOOL_DEFS.viewport_editor = {
 		lightBtnRow.BackgroundTransparency = 1
 		lightBtnRow.AutomaticSize = Enum.AutomaticSize.Y
 		lightBtnRow.Size = UDim2.new(1, 0, 0, 24)
-		lightBtnRow.LayoutOrder = 5
+		lightBtnRow.LayoutOrder = 6
 		lightBtnRow.Parent = holder
 		do
 			local l = Instance.new("UIListLayout")
@@ -2522,7 +2562,7 @@ TOOL_DEFS.viewport_editor = {
 		lightSliders.BackgroundTransparency = 1
 		lightSliders.AutomaticSize = Enum.AutomaticSize.Y
 		lightSliders.Size = UDim2.new(1, 0, 0, 0)
-		lightSliders.LayoutOrder = 6
+		lightSliders.LayoutOrder = 7
 		lightSliders.Parent = holder
 		do
 			local l = Instance.new("UIListLayout")
@@ -2554,6 +2594,7 @@ TOOL_DEFS.viewport_editor = {
 			if not ref then
 				status.Text = "Select a ViewportFrame to edit."
 				addCam.Visible = false
+				restoreCam.Visible = false
 				btnRow.Visible = false
 				sliderHolder.Visible = false
 				lightBtnRow.Visible = false
@@ -2564,6 +2605,7 @@ TOOL_DEFS.viewport_editor = {
 			status.Text = (#vfs == 1) and ("Editing: " .. safeName(ref))
 				or ("Editing: " .. #vfs .. " ViewportFrames")
 			addCam.Visible = not hasCam
+			restoreCam.Visible = (not hasCam) and hasStoredCamera(ref)
 			btnRow.Visible = hasCam
 			sliderHolder.Visible = hasCam
 			lightBtnRow.Visible = hasCam
