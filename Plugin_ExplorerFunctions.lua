@@ -2063,6 +2063,10 @@ local function onPasteCamera()
 					end
 				end
 				writeOrbit(vf, viewportClip.orbit)
+				-- writeOrbit only persists the orbit attributes; keep VE_FOV in
+				-- sync with the just-pasted FieldOfView so a later rasterize /
+				-- restore (and the UI read) match without a manual slider nudge.
+				vf:SetAttribute("VE_FOV", vf.CurrentCamera.FieldOfView)
 			end
 		end
 	end)
