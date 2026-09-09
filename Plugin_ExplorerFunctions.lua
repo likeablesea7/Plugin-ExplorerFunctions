@@ -102,6 +102,11 @@ local PROP_CATALOG = {
 	-- copied.
 	{ cat = "Physics", style = true, props = {
 		"Anchored", "CanCollide", "CanTouch", "CanQuery", "Locked", "Massless", "CastShadow", "Shape",
+		-- CustomPhysicalProperties is a single PhysicalProperties value (it holds
+		-- Density / Friction / Elasticity + weights). It reads nil when custom
+		-- physics is off, so copying a plain part carries nothing and leaves the
+		-- target's physics alone; copying a part with custom physics carries it.
+		"CustomPhysicalProperties",
 	}},
 	{ cat = "Surface", style = true, props = {
 		"Color", "Material", "MaterialVariant", "Transparency", "Reflectance",
