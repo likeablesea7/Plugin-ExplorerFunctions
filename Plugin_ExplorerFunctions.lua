@@ -93,6 +93,11 @@ local PROP_CATALOG = {
 	{ cat = "Viewport", style = true, props = {
 		"Ambient", "LightColor", "LightDirection",
 	}},
+	-- UIPadding modifier: all four insets. Style = true so Copy Style carries them,
+	-- and they surface in the Copy checkbox menu when a UIPadding is selected.
+	{ cat = "Padding", style = true, class = "UIPadding", props = {
+		"PaddingTop", "PaddingBottom", "PaddingLeft", "PaddingRight",
+	}},
 
 	-- Non-UI (3D / physics) properties. These share the flat detect-by-read
 	-- mechanism, so any class exposing them (Part, MeshPart, Model, Attachment,
@@ -100,15 +105,21 @@ local PROP_CATALOG = {
 	-- Physics / Surface / Mesh count as "style" for Copy Style: for a Part/MeshPart
 	-- everything except its transform (Position / Size / CFrame / Orientation) is
 	-- copied.
-	{ cat = "Physics", style = true, props = {
+	{ cat = "Physics", style = true, class = "BasePart", props = {
 		"Anchored", "CanCollide", "CanTouch", "CanQuery", "Locked", "Massless", "CastShadow", "Shape",
+		"EnableFluidForces",
 		-- CustomPhysicalProperties is a single PhysicalProperties value (it holds
 		-- Density / Friction / Elasticity + weights). It reads nil when custom
 		-- physics is off, so copying a plain part carries nothing and leaves the
 		-- target's physics alone; copying a part with custom physics carries it.
 		"CustomPhysicalProperties",
 	}},
-	{ cat = "Surface", style = true, props = {
+	-- BasePart-only: Transparency here is BasePart.Transparency. GuiObject also has
+	-- a (combined) Transparency whose setter writes TextTransparency/ImageTransparency,
+	-- so without this class gate, copying a UI element's Transparency would clobber
+	-- the target's TextTransparency. GUI transparency is covered by the individual
+	-- Background / Text / Image / Canvas Group categories instead.
+	{ cat = "Surface", style = true, class = "BasePart", props = {
 		"Color", "Material", "MaterialVariant", "Transparency", "Reflectance",
 	}},
 	{ cat = "Mesh", style = true, props = {
@@ -152,7 +163,10 @@ local PROP_INFO = {}
 for _, group in ipairs(PROP_CATALOG) do
 	for _, name in ipairs(group.props) do
 		table.insert(PROP_ORDER, name)
-		PROP_INFO[name] = { cat = group.cat, style = group.style == true }
+		-- `class` (optional) restricts a group to instances of that class, so a
+		-- property that exists on more than one base (e.g. GuiObject.Transparency
+		-- vs BasePart.Transparency) is only detected on the base it's meant for.
+		PROP_INFO[name] = { cat = group.cat, style = group.style == true, class = group.class }
 	end
 end
 
@@ -289,11 +303,11 @@ local function latestGui()
 	return nil
 end
 
--- Last selected instance if Copy Style / Copy Pos can read it: a UI element or a
--- BasePart (Part, MeshPart, ...).
+-- Last selected instance if Copy Style / Copy Pos can read it: a UI element, a
+-- BasePart (Part, MeshPart, ...), or a UIPadding modifier.
 local function latestCopyable()
 	local inst = latestSelected()
-	if inst and (isA(inst, "GuiObject") or isA(inst, "BasePart")) then
+	if inst and (isA(inst, "GuiObject") or isA(inst, "BasePart") or isA(inst, "UIPadding")) then
 		return inst
 	end
 	return nil
@@ -380,9 +394,12 @@ end
 local function detectProps(inst)
 	local out = {}
 	for _, name in ipairs(PROP_ORDER) do
-		local ok, v = readProp(inst, name)
-		if ok then
-			table.insert(out, { name = name, value = v, cat = PROP_INFO[name].cat, style = PROP_INFO[name].style })
+		local info = PROP_INFO[name]
+		if not info.class or isA(inst, info.class) then
+			local ok, v = readProp(inst, name)
+			if ok then
+				table.insert(out, { name = name, value = v, cat = info.cat, style = info.style })
+			end
 		end
 	end
 	return out
@@ -1586,11 +1603,9 @@ local function onCopyStyle()
 			copied[p.name] = p.value
 		end
 	end
-	-- Also carry the Text, unless it's the default "Label" (which we never want).
-	local ok, txt = readProp(inst, "Text")
-	if ok and typeof(txt) == "string" and txt ~= "Label" then
-		copied.Text = txt
-	end
+	-- Note: the literal Text is intentionally NOT copied. Text lives in the
+	-- non-style "Text Content" category, so Copy Style carries appearance only
+	-- (font / size / color / transparency) and leaves the target's own Text intact.
 	if refreshTopbar then refreshTopbar() end
 end
 
